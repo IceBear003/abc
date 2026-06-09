@@ -22870,7 +22870,7 @@ int Abc_CommandIf( Abc_Frame_t * pAbc, int argc, char ** argv )
     If_ManSetDefaultPars( pPars );
     pPars->pLutLib = (If_LibLut_t *)Abc_FrameReadLibLut();
     Extra_UtilGetoptReset();
-    while ( ( c = Extra_UtilGetopt( argc, argv, "KCFAGRNTXYZUDEWSJLPqalepmrsdbgxyzuoiktncfvh" ) ) != EOF )
+    while ( ( c = Extra_UtilGetopt( argc, argv, "KCFAGRNTXYZUDEWSJLPQqalepmrsdbgxyzuoiktncfvh" ) ) != EOF )
     {
         switch ( c )
         {
@@ -23078,6 +23078,45 @@ int Abc_CommandIf( Abc_Frame_t * pAbc, int argc, char ** argv )
         case 'P':
             pPars->fDualOutput ^= 1;
             break;
+        case 'Q':
+            if ( globalUtilOptind >= argc )
+            {
+                Abc_Print( -1, "Command line switch \"-Q\" should be followed by architecture name.\n" );
+                goto usage;
+            }
+            if ( !strcmp(argv[globalUtilOptind], "ultrascale") || !strcmp(argv[globalUtilOptind], "ultrascale+") )
+            {
+                pPars->nDualArch = 1;
+                pPars->nDualKSingle = 6;
+                pPars->nDualI = 5;
+                pPars->nDualS = 5;
+                pPars->nDualK = 5;
+            }
+            else if ( !strcmp(argv[globalUtilOptind], "versal") )
+            {
+                pPars->nDualArch = 2;
+                pPars->nDualKSingle = 6;
+                pPars->nDualI = 6;
+                pPars->nDualS = 6;
+                pPars->nDualK = 6;
+            }
+            else if ( !strcmp(argv[globalUtilOptind], "alm") || !strcmp(argv[globalUtilOptind], "intel") )
+            {
+                pPars->nDualArch = 3;
+                pPars->nDualKSingle = 8;
+                pPars->nDualI = 8;
+                pPars->nDualS = 4;
+                pPars->nDualK = 6;
+            }
+            else
+            {
+                Abc_Print( -1, "Unknown dual-output architecture \"%s\" (expected ultrascale, versal, or alm).\n", argv[globalUtilOptind] );
+                goto usage;
+            }
+            pPars->nLutSize = pPars->nDualKSingle;
+            pPars->pLutLib = NULL;
+            globalUtilOptind++;
+            break;
         case 'q':
             pPars->fPreprocess ^= 1;
             break;
@@ -23178,6 +23217,11 @@ int Abc_CommandIf( Abc_Frame_t * pAbc, int argc, char ** argv )
         Abc_Print( -1, "Incorrect LUT size (%d).\n", pPars->nLutSize );
         return 1;
     }
+    if ( pPars->nDualArch && pPars->nLutSize != pPars->nDualKSingle )
+    {
+        Abc_Print( -1, "Dual architecture requires LUT size %d, but -K is %d.\n", pPars->nDualKSingle, pPars->nLutSize );
+        return 1;
+    }
 
     if ( pPars->nCutsMax < 1 || pPars->nCutsMax >= (1<<12) )
     {
@@ -23186,6 +23230,13 @@ int Abc_CommandIf( Abc_Frame_t * pAbc, int argc, char ** argv )
     }
     if ( pPars->fDualOutput )
     {
+        if ( pPars->nDualKSingle == 0 )
+        {
+            pPars->nDualKSingle = pPars->nLutSize;
+            pPars->nDualI = pPars->nLutSize - 1;
+            pPars->nDualS = pPars->nLutSize - 1;
+            pPars->nDualK = pPars->nLutSize - 1;
+        }
         pPars->fStrictDepth = 1;
         pPars->fTruth = 1;
     }
@@ -23463,7 +23514,7 @@ usage:
         sprintf(LutSize, "library" );
     else
         sprintf(LutSize, "%d", pPars->nLutSize );
-    Abc_Print( -2, "usage: if [-KCFAGRNTXYZMU num] [-DEW float] [-SJ str] [-LPqarlepmsdbgxyuoiktnczfvh]\n" );
+    Abc_Print( -2, "usage: if [-KCFAGRNTXYZMU num] [-DEW float] [-SJQ str] [-LPqarlepmsdbgxyuoiktnczfvh]\n" );
     Abc_Print( -2, "\t           performs FPGA technology mapping of the network\n" );
     Abc_Print( -2, "\t-K num   : the number of LUT inputs (2 < num < %d) [default = %s]\n", IF_MAX_LUTSIZE+1, LutSize );
     Abc_Print( -2, "\t-C num   : the max number of priority cuts (0 < num < 2^12) [default = %d]\n", pPars->nCutsMax );
@@ -23484,6 +23535,7 @@ usage:
     Abc_Print( -2, "\t-J str   : string representing the LUT structure (new method) [default = %s]\n", pPars->pLutStruct ? pPars->pLutStruct : "not used" );
     Abc_Print( -2, "\t-L       : toggles strict max-level dynamic programming [default = %s]\n", pPars->fStrictDepth? "yes": "no" );
     Abc_Print( -2, "\t-P       : toggles dual-output LUT mapping (also enables -L) [default = %s]\n", pPars->fDualOutput? "yes": "no" );
+    Abc_Print( -2, "\t-Q str   : dual-output architecture: ultrascale, versal, or alm [default = generic K-1]\n" );
     Abc_Print( -2, "\t-q       : toggles preprocessing using several starting points [default = %s]\n", pPars->fPreprocess? "yes": "no" );
     Abc_Print( -2, "\t-a       : toggles area-oriented mapping [default = %s]\n", pPars->fArea? "yes": "no" );
     Abc_Print( -2, "\t-r       : enables expansion/reduction of the best cuts [default = %s]\n", pPars->fExpRed? "yes": "no" );

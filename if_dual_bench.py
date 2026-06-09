@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run baseline/strict/dual IF mapping experiments and summarize LUT stats."""
+"""Run architecture-aware baseline/dual IF mapping experiments."""
 
 from __future__ import annotations
 
@@ -7,38 +7,32 @@ import argparse
 import concurrent.futures
 import csv
 import os
-import shutil
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 
+ARCHES = {
+    "ultrascale": {"Ksingle": 6, "Idual": 5, "Isharing": 5, "Kdual": 5},
+    "versal": {"Ksingle": 6, "Idual": 6, "Isharing": 6, "Kdual": 6},
+    "alm": {"Ksingle": 8, "Idual": 8, "Isharing": 4, "Kdual": 6},
+}
 SINGLE_RE = re.compile(r"\s+lut(?P<n>\d+)\s*#\((?P<tt>[^)]*)\)\s+\S+\s*\(\s*\{(?P<inputs>[^}]*)\}\s*,\s*(?P<out>[^)]+?)\s*\)\s*;")
 DUAL_RE = re.compile(r"\s+dual_lut(?P<n>\d+)\s*#\((?P<params>[^)]*)\)\s+\S+\s*\(\s*\{(?P<inputs>[^}]*)\}\s*,\s*(?P<z5>[^,]+?)\s*,\s*(?P<z>[^)]+?)\s*\)\s*;")
 CONST_RE = re.compile(r"(?:(?P<bits>\d+)\s*)?'(?P<base>[bBdDhH])(?P<value>[0-9a-fA-F_xzXZ]+)|(?P<plain>[01])")
-MODES = [
-    ("baseline", ""),
-    # ("strict", "-L"),
-    ("dual", "-P"),
-]
 
 
 def split_signals(text: str) -> list[str]:
     return [token.strip() for token in text.split(",") if token.strip()]
 
 
-def is_const(sig: str) -> bool:
-    return parse_const(sig) is not None
-
-
 def clean_sig(sig: str) -> str:
     sig = sig.strip()
-    if sig.startswith("\\"):
-        sig = sig[1:]
-    return sig.strip()
+    return sig[1:].strip() if sig.startswith("\\") else sig
 
 
 def parse_const(sig: str) -> int | None:
@@ -54,7 +48,7 @@ def parse_const(sig: str) -> int | None:
     return int(value, {"b": 2, "d": 10, "h": 16}[m.group("base").lower()]) & 1
 
 
-def parse_truth_const(text: str) -> int:
+def parse_truth_const(text: str) -> tuple[int, int]:
     text = text.strip()
     m = CONST_RE.fullmatch(text)
     if not m or m.group("plain") is not None:
@@ -62,63 +56,61 @@ def parse_truth_const(text: str) -> int:
     value = m.group("value").replace("_", "").lower()
     if "x" in value or "z" in value:
         raise ValueError(f"unsupported unknown truth-table constant: {text!r}")
-    return int(value, {"b": 2, "d": 10, "h": 16}[m.group("base").lower()])
+    bits = m.group("bits")
+    if bits is not None:
+        width = int(bits)
+    elif m.group("base").lower() == "b":
+        width = len(value)
+    elif m.group("base").lower() == "h":
+        width = 4 * len(value)
+    else:
+        width = max(1, int(value, 10).bit_length())
+    return int(value, {"b": 2, "d": 10, "h": 16}[m.group("base").lower()]), width
 
 
 def support_signals(input_terms: list[str], tt: int, width: int) -> list[str]:
-    """Return only signals that actually affect TT[in].
-
-    This avoids false paths in dual_lutN: z5 ignores the select input, and both
-    outputs may ignore padded constants or functionally redundant data inputs.
-    """
     vars_seen: list[str] = []
     term_map: list[tuple[str | None, int | None]] = []
     for term in input_terms:
         const = parse_const(term)
         if const is not None:
             term_map.append((None, const))
-            continue
-        name = clean_sig(term)
-        if name not in vars_seen:
-            vars_seen.append(name)
-        term_map.append((name, None))
+        else:
+            name = clean_sig(term)
+            if name not in vars_seen:
+                vars_seen.append(name)
+            term_map.append((name, None))
 
     def eval_with(assign: int, names: list[str]) -> int:
         var_pos = {name: i for i, name in enumerate(names)}
         full_index = 0
         for pos, (name, const) in enumerate(term_map):
-            if const is not None:
-                bit = const
-            else:
-                bit = (assign >> (len(names) - 1 - var_pos[name])) & 1
+            bit = const if const is not None else (assign >> (len(names) - 1 - var_pos[name])) & 1
             if bit:
                 full_index |= 1 << (width - 1 - pos)
         return (tt >> full_index) & 1
 
     support: list[str] = []
-    n_all = len(vars_seen)
     for i_var, name in enumerate(vars_seen):
-        depends = False
-        bit_pos = n_all - 1 - i_var
-        for assign in range(1 << n_all):
+        bit_pos = len(vars_seen) - 1 - i_var
+        for assign in range(1 << len(vars_seen)):
             if (assign >> bit_pos) & 1:
                 continue
             if eval_with(assign, vars_seen) != eval_with(assign | (1 << bit_pos), vars_seen):
-                depends = True
+                support.append(name)
                 break
-        if depends:
-            support.append(name)
     return support
 
 
-def stats_from_verilog(path: Path, lut_size: int) -> dict[str, int]:
-    """Count physical LUT instances and pins from the emitted LUT Verilog.
+def dual_terms_and_width(inputs_all: list[str], tt_width: int, n: int) -> tuple[list[str], int]:
+    if tt_width == (1 << n):
+        return inputs_all, n
+    if tt_width == (1 << (n - 1)):
+        return inputs_all[1:], n - 1
+    raise ValueError(f"dual_lut{n} truth width {tt_width} does not match {1 << n} or {1 << (n - 1)}")
 
-    Depth is computed from functional support of each emitted LUT output.  This
-    is the authoritative dual-output depth because ABC's generic lev statistic
-    cannot see that some dual_lut inputs are functionally irrelevant to one of
-    the two outputs.
-    """
+
+def stats_from_verilog(path: Path, lut_size: int) -> dict[str, int]:
     counts = {f"LUT{i}": 0 for i in range(1, lut_size + 1)}
     dual_count = 0
     physical_pins = 0
@@ -130,69 +122,49 @@ def stats_from_verilog(path: Path, lut_size: int) -> dict[str, int]:
         if m_dual:
             n = int(m_dual.group("n"))
             params = split_signals(m_dual.group("params"))
-            if len(params) != 2:
-                raise ValueError(f"{path}: dual_lut{n} expects two truth tables")
             inputs_all = split_signals(m_dual.group("inputs"))
-            data_inputs = [clean_sig(sig) for sig in inputs_all if not is_const(sig)]
-            z5_terms = inputs_all[1:]
-            z5_support = support_signals(z5_terms, parse_truth_const(params[0]), n - 1)
-            z_tt = parse_truth_const(params[1])
-            z_support = support_signals(z5_terms, z_tt, n - 1)
-            deps[clean_sig(m_dual.group("z5"))] = z5_support
-            deps[clean_sig(m_dual.group("z"))] = z_support
+            if len(params) != 2 or len(inputs_all) != n:
+                raise ValueError(f"{path}: malformed dual_lut{n}")
+            tt0, width0 = parse_truth_const(params[0])
+            tt1, width1 = parse_truth_const(params[1])
+            if width0 != width1:
+                raise ValueError(f"{path}: dual_lut{n} truth widths differ")
+            terms, width = dual_terms_and_width(inputs_all, width0, n)
+            deps[clean_sig(m_dual.group("z5"))] = support_signals(terms, tt0, width)
+            deps[clean_sig(m_dual.group("z"))] = support_signals(terms, tt1, width)
             dual_count += 1
-            # Physical package pins: N shared inputs plus two outputs.  The
-            # used-input count ignores padded constants for sanity checking.
             physical_pins += n + 2
-            used_input_pins += len(data_inputs) + 2
+            used_input_pins += len([sig for sig in inputs_all if parse_const(sig) is None]) + 2
             continue
 
         m_single = SINGLE_RE.match(line)
         if m_single:
             n = int(m_single.group("n"))
             inputs_all = split_signals(m_single.group("inputs"))
-            data_inputs = [clean_sig(sig) for sig in inputs_all if not is_const(sig)]
-            support = support_signals(inputs_all, parse_truth_const(m_single.group("tt")), n)
-            used = max(1, len(data_inputs))
+            tt, width = parse_truth_const(m_single.group("tt"))
+            support = support_signals(inputs_all, tt, width.bit_length() - 1)
+            used = max(1, len([sig for sig in inputs_all if parse_const(sig) is None]))
             if used <= lut_size:
                 counts[f"LUT{used}"] += 1
             deps[clean_sig(m_single.group("out"))] = support
             physical_pins += used + 1
-            used_input_pins += len(data_inputs) + 1
+            used_input_pins += len([sig for sig in inputs_all if parse_const(sig) is None]) + 1
 
     memo: dict[str, int] = {}
-    active: set[str] = set()
 
     def depth_of(root: str) -> int:
         root = clean_sig(root)
+        if root in memo:
+            return memo[root]
         if root not in deps:
             return 0
-        stack: list[tuple[str, bool]] = [(root, False)]
-        while stack:
-            sig, expanded = stack.pop()
-            sig = clean_sig(sig)
-            if sig not in deps or sig in memo:
-                continue
-            if expanded:
-                active.discard(sig)
-                memo[sig] = 1 + max((memo.get(clean_sig(dep), 0) for dep in deps[sig]), default=0)
-                continue
-            if sig in active:
-                memo[sig] = 0
-                continue
-            active.add(sig)
-            stack.append((sig, True))
-            for dep in deps[sig]:
-                dep = clean_sig(dep)
-                if dep in deps and dep not in memo:
-                    stack.append((dep, False))
-        return memo.get(root, 0)
+        memo[root] = 1 + max((depth_of(dep) for dep in deps[root]), default=0)
+        return memo[root]
 
-    max_depth = max((depth_of(out) for out in deps), default=0)
     result = dict(counts)
     result[f"dual_lut{lut_size}"] = dual_count
     result["total_luts"] = sum(counts.values()) + dual_count
-    result["max_depth"] = max_depth
+    result["max_depth"] = max((depth_of(out) for out in deps), default=0)
     result["physical_pins"] = physical_pins
     result["used_input_pins"] = used_input_pins
     return result
@@ -207,50 +179,21 @@ def wait_with_rusage(proc: subprocess.Popen[str]) -> tuple[int, int | None]:
     return proc.wait(), None
 
 
-def run_abc(abc: Path, src: Path, out: Path, lut_size: int, if_opts: str, stream: bool = True) -> tuple[str, float, int | None]:
+def run_abc(abc: Path, src: Path, out: Path, lut_size: int, if_opts: str, stream: bool) -> tuple[str, float, int | None]:
     out.parent.mkdir(parents=True, exist_ok=True)
-    # Keep preprocessing identical across modes so the CSV compares only the
-    # mapper options: baseline, strict-depth, and dual-output.
-    command = (
-        f"read_verilog {shlex.quote(str(src))}; "
-        "strash; dch; "
-        f"if -K {lut_size} {if_opts}; "
-        f"write_verilog -K {lut_size} {shlex.quote(str(out))}; "
-        "print_stats"
-    )
+    command = f"read_verilog {shlex.quote(str(src))}; strash; dch; if -K {lut_size} {if_opts}; write_verilog -K {lut_size} {shlex.quote(str(out))}; print_stats"
     argv = [str(abc), "-c", command]
     if shutil.which("stdbuf"):
         argv = ["stdbuf", "-oL", "-eL"] + argv
     start = time.perf_counter()
-    if not stream:
-        proc = subprocess.Popen(
-            argv,
-            cwd=abc.parent,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        assert proc.stdout is not None
-        stdout = proc.stdout.read()
-        retcode, max_rss_kb = wait_with_rusage(proc)
-        elapsed = time.perf_counter() - start
-        log = stdout or ""
-        if retcode != 0 or not out.exists():
-            raise RuntimeError(f"ABC failed for {src} [{if_opts}]\n{log}")
-        return log, elapsed, max_rss_kb
-    proc = subprocess.Popen(
-        argv,
-        cwd=abc.parent,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    chunks: list[str] = []
+    proc = subprocess.Popen(argv, cwd=abc.parent, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     assert proc.stdout is not None
+    chunks: list[str] = []
     for chunk in proc.stdout:
         chunks.append(chunk)
-        sys.stdout.write(chunk)
-        sys.stdout.flush()
+        if stream:
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
     retcode, max_rss_kb = wait_with_rusage(proc)
     elapsed = time.perf_counter() - start
     log = "".join(chunks)
@@ -259,18 +202,18 @@ def run_abc(abc: Path, src: Path, out: Path, lut_size: int, if_opts: str, stream
     return log, elapsed, max_rss_kb
 
 
-def run_job(abc: Path, bench_dir: Path, out_dir: Path, src: Path, lut_size: int, mode: str, if_opts: str, stream: bool) -> dict[str, str]:
+def run_job(abc: Path, bench_dir: Path, out_dir: Path, src: Path, arch: str, mode: str, stream: bool) -> dict[str, str]:
+    cfg = ARCHES[arch]
     rel = src.relative_to(bench_dir)
-    stem = rel.with_suffix("")
-    out = out_dir / mode / f"{stem}.v"
-    log, elapsed, max_rss_kb = run_abc(abc.resolve(), src.resolve(), out, lut_size, if_opts, stream=stream)
-    log_path = out_dir / mode / f"{stem}.log"
+    out = out_dir / arch / mode / f"{rel.with_suffix('')}.v"
+    if_opts = "" if mode == "baseline" else f"-P -Q {arch}"
+    log, elapsed, max_rss_kb = run_abc(abc.resolve(), src.resolve(), out, cfg["Ksingle"], if_opts, stream)
+    log_path = out_dir / arch / mode / f"{rel.with_suffix('')}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(log)
-    row = {"design": str(rel), "mode": mode, "verilog": str(out), "runtime_sec": f"{elapsed:.3f}"}
-    row["max_rss_kb"] = "" if max_rss_kb is None else str(max_rss_kb)
-    row.update(stats_from_verilog(out, lut_size))
-    return row
+    row = {"arch": arch, **{k: str(v) for k, v in cfg.items()}, "design": str(rel), "mode": mode, "verilog": str(out), "runtime_sec": f"{elapsed:.3f}", "max_rss_kb": "" if max_rss_kb is None else str(max_rss_kb)}
+    row.update(stats_from_verilog(out, cfg["Ksingle"]))
+    return {k: str(v) for k, v in row.items()}
 
 
 def main() -> int:
@@ -279,93 +222,71 @@ def main() -> int:
     parser.add_argument("--bench-dir", type=Path, default=Path("benchmarks/tested"))
     parser.add_argument("--out-dir", type=Path, default=Path("if_dual_results"))
     parser.add_argument("--jobs", type=int, default=1)
-    parser.add_argument("-K", "--lut-size", type=int, default=6)
+    parser.add_argument("--arch", choices=["ultrascale", "versal", "alm", "all"], default="all")
     args = parser.parse_args()
+    arches = list(ARCHES) if args.arch == "all" else [args.arch]
+    benches = sorted(args.bench_dir.rglob("*.v"))
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
-
-    benches = sorted(args.bench_dir.rglob("*.v"))
     if not benches:
         print(f"no Verilog benchmarks found under {args.bench_dir}")
         return 0
 
-    results_by_design: dict[str, dict[str, dict[str, str]]] = {}
+    results: dict[tuple[str, str], dict[str, dict[str, str]]] = {}
+    jobs = [(src, arch, mode) for arch in arches for src in benches for mode in ("baseline", "dual")]
     if args.jobs == 1:
-        for src in benches:
-            rel = src.relative_to(args.bench_dir)
-            results_by_design.setdefault(str(rel), {})
-            for mode, if_opts in MODES:
-                print(f"\n===== {rel} [{mode}] start =====", flush=True)
-                row = run_job(args.abc, args.bench_dir, args.out_dir, src, args.lut_size, mode, if_opts, stream=True)
-                results_by_design[str(rel)][mode] = row
-                print(f"===== {rel} [{mode}] done in {float(row['runtime_sec']):.2f}s =====\n", flush=True)
+        for src, arch, mode in jobs:
+            row = run_job(args.abc, args.bench_dir, args.out_dir, src, arch, mode, True)
+            results.setdefault((arch, row["design"]), {})[mode] = row
     else:
-        jobs = [(src, mode, if_opts) for src in benches for mode, if_opts in MODES]
         print(f"running {len(jobs)} ABC jobs with {args.jobs} workers", flush=True)
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
-            future_to_job = {
-                executor.submit(run_job, args.abc, args.bench_dir, args.out_dir, src, args.lut_size, mode, if_opts, False): (src, mode)
-                for src, mode, if_opts in jobs
-            }
-            for future in concurrent.futures.as_completed(future_to_job):
-                src, mode = future_to_job[future]
-                rel = src.relative_to(args.bench_dir)
-                row = future.result()
-                results_by_design.setdefault(str(rel), {})[mode] = row
-                print(f"===== {rel} [{mode}] done in {float(row['runtime_sec']):.2f}s =====", flush=True)
+            futs = {executor.submit(run_job, args.abc, args.bench_dir, args.out_dir, src, arch, mode, False): (src, arch, mode) for src, arch, mode in jobs}
+            for fut in concurrent.futures.as_completed(futs):
+                row = fut.result()
+                results.setdefault((row["arch"], row["design"]), {})[row["mode"]] = row
+                print(f"===== {row['arch']} {row['design']} [{row['mode']}] done in {float(row['runtime_sec']):.2f}s =====", flush=True)
 
-    mode_order = {mode: i for i, (mode, _) in enumerate(MODES)}
-    rows = []
-    runtime_rows = []
-    for design in sorted(results_by_design):
-        design_rows = [results_by_design[design][mode] for mode, _ in MODES if mode in results_by_design[design]]
-        baseline_row = next((row for row in design_rows if row["mode"] == "baseline"), None)
-        baseline_luts = int(baseline_row["total_luts"]) if baseline_row else 0
-        baseline_time = float(baseline_row["runtime_sec"]) if baseline_row else 0.0
-        mode_times = {row["mode"]: float(row["runtime_sec"]) for row in design_rows}
-        mode_rss = {row["mode"]: row.get("max_rss_kb", "") for row in design_rows}
-        for row in sorted(design_rows, key=lambda row: mode_order.get(row["mode"], len(mode_order))):
-            total_luts = int(row["total_luts"])
-            runtime = float(row["runtime_sec"])
-            if row["mode"] == "baseline":
+    rows: list[dict[str, str]] = []
+    runtime_rows: list[dict[str, str]] = []
+    for (arch, design), modes in sorted(results.items()):
+        baseline = modes.get("baseline")
+        base_luts = int(baseline["total_luts"]) if baseline else 0
+        base_time = float(baseline["runtime_sec"]) if baseline else 0.0
+        for mode in ("baseline", "dual"):
+            if mode not in modes:
+                continue
+            row = modes[mode]
+            if mode == "baseline":
                 row["area_saved_percent"] = "0.000"
                 row["runtime_scale"] = "1.000"
-            elif baseline_luts > 0:
-                row["area_saved_percent"] = f"{100.0 * (baseline_luts - total_luts) / baseline_luts:.3f}"
-                row["runtime_scale"] = f"{runtime / baseline_time:.3f}" if baseline_time > 0 else ""
             else:
-                row["area_saved_percent"] = ""
-                row["runtime_scale"] = ""
+                row["area_saved_percent"] = f"{100.0 * (base_luts - int(row['total_luts'])) / base_luts:.3f}" if base_luts else ""
+                row["runtime_scale"] = f"{float(row['runtime_sec']) / base_time:.3f}" if base_time else ""
             rows.append(row)
         runtime_rows.append({
+            "arch": arch,
+            "Ksingle": str(ARCHES[arch]["Ksingle"]),
+            "Idual": str(ARCHES[arch]["Idual"]),
+            "Isharing": str(ARCHES[arch]["Isharing"]),
+            "Kdual": str(ARCHES[arch]["Kdual"]),
             "design": design,
-            "baseline_sec": f"{mode_times.get('baseline', 0.0):.3f}",
-            "baseline_rss_kb": mode_rss.get("baseline", ""),
-            "strict_sec": f"{mode_times.get('strict', 0.0):.3f}",
-            "strict_rss_kb": mode_rss.get("strict", ""),
-            "dual_sec": f"{mode_times.get('dual', 0.0):.3f}",
-            "dual_rss_kb": mode_rss.get("dual", ""),
-            "strict_runtime_scale": f"{mode_times.get('strict', 0.0) / mode_times['baseline']:.3f}" if mode_times.get("baseline", 0.0) > 0 else "",
-            "dual_runtime_scale": f"{mode_times.get('dual', 0.0) / mode_times['baseline']:.3f}" if mode_times.get("baseline", 0.0) > 0 else "",
-            "total_sec": f"{sum(mode_times.values()):.3f}",
+            "baseline_sec": modes.get("baseline", {}).get("runtime_sec", "0.000"),
+            "baseline_rss_kb": modes.get("baseline", {}).get("max_rss_kb", ""),
+            "dual_sec": modes.get("dual", {}).get("runtime_sec", "0.000"),
+            "dual_rss_kb": modes.get("dual", {}).get("max_rss_kb", ""),
+            "dual_runtime_scale": rows[-1].get("runtime_scale", "") if rows else "",
         })
 
-    fieldnames = ["design", "mode", "verilog", "runtime_sec", "max_rss_kb"] + [f"LUT{i}" for i in range(1, args.lut_size + 1)] + [
-        f"dual_lut{args.lut_size}",
-        "total_luts",
-        "area_saved_percent",
-        "runtime_scale",
-        "max_depth",
-        "physical_pins",
-        "used_input_pins",
-    ]
+    max_k = max(ARCHES[a]["Ksingle"] for a in arches)
+    fieldnames = ["arch", "Ksingle", "Idual", "Isharing", "Kdual", "design", "mode", "verilog", "runtime_sec", "max_rss_kb"] + [f"LUT{i}" for i in range(1, max_k + 1)] + [f"dual_lut{k}" for k in sorted({ARCHES[a]["Ksingle"] for a in arches})] + ["total_luts", "area_saved_percent", "runtime_scale", "max_depth", "physical_pins", "used_input_pins"]
     args.out_dir.mkdir(parents=True, exist_ok=True)
     with (args.out_dir / "summary.csv").open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
     with (args.out_dir / "runtime_summary.csv").open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["design", "baseline_sec", "baseline_rss_kb", "strict_sec", "strict_rss_kb", "dual_sec", "dual_rss_kb", "strict_runtime_scale", "dual_runtime_scale", "total_sec"])
+        writer = csv.DictWriter(f, fieldnames=["arch", "Ksingle", "Idual", "Isharing", "Kdual", "design", "baseline_sec", "baseline_rss_kb", "dual_sec", "dual_rss_kb", "dual_runtime_scale"])
         writer.writeheader()
         writer.writerows(runtime_rows)
     print(f"wrote {args.out_dir / 'summary.csv'}")

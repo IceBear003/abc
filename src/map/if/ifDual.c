@@ -272,17 +272,35 @@ static void If_DualSortLeaves( int * pLeaves, int nLeaves )
                 ABC_SWAP( int, pLeaves[i], pLeaves[k] );
 }
 
-/* 加入一个 cut 的 leaves；若 leaf 是另一个输出 root，则展开成该 root 的 cut leaves。 */
-static int If_DualAddExpandedCutLeaves( If_Cut_t * pCut, int OtherRoot, If_Cut_t * pOtherCut, int * pLeaves, int * pnLeaves, int Limit )
+/* 判断 cut 的第 i 个 leaf 是否真的影响该 cut 的输出；truth 缺失时保守认为依赖。 */
+static int If_DualCutLeafDepends( If_Man_t * p, If_Cut_t * pCut, int iLeaf )
+{
+    word * pTruth;
+    if ( iLeaf < 0 || iLeaf >= (int)pCut->nLeaves )
+        return 0;
+    if ( !p->pPars->fTruth || pCut->iCutFunc < 0 || p->vTtMem[pCut->nLeaves] == NULL )
+        return 1;
+    pTruth = If_CutTruthW( p, pCut );
+    return Abc_TtHasVar( pTruth, pCut->nLeaves, iLeaf );
+}
+
+/* 加入一个 cut 的 functional support；若 leaf 是另一个输出 root，则展开成该 root 的 support。 */
+static int If_DualAddExpandedCutSupport( If_Man_t * p, If_Cut_t * pCut, int OtherRoot, If_Cut_t * pOtherCut, int * pLeaves, int * pnLeaves, int Limit )
 {
     int i, k;
     for ( i = 0; i < (int)pCut->nLeaves; i++ )
     {
+        if ( !If_DualCutLeafDepends(p, pCut, i) )
+            continue;
         if ( pCut->pLeaves[i] == OtherRoot )
         {
             for ( k = 0; k < (int)pOtherCut->nLeaves; k++ )
+            {
+                if ( !If_DualCutLeafDepends(p, pOtherCut, k) )
+                    continue;
                 if ( !If_DualPushLeafUnique( pLeaves, pnLeaves, pOtherCut->pLeaves[k], Limit ) )
                     return 0;
+            }
         }
         else if ( !If_DualPushLeafUnique( pLeaves, pnLeaves, pCut->pLeaves[i], Limit ) )
             return 0;
@@ -290,15 +308,36 @@ static int If_DualAddExpandedCutLeaves( If_Cut_t * pCut, int OtherRoot, If_Cut_t
     return 1;
 }
 
-/* 合并两个 cut 的物理输入集合；串联时把内部输出 root 展开为它自己的 leaves。 */
-static int If_DualMergeLeaves( If_Obj_t * pObj0, If_Cut_t * pCut0, If_Obj_t * pObj1, If_Cut_t * pCut1, int * pLeaves, int Limit )
+static int If_DualSetIntersectionSize( int * pSet0, int nSet0, int * pSet1, int nSet1 )
 {
-    int nLeaves = 0;
-    if ( !If_DualAddExpandedCutLeaves( pCut0, pObj1->Id, pCut1, pLeaves, &nLeaves, Limit ) )
+    int i, k, Counter = 0;
+    for ( i = 0; i < nSet0; i++ )
+        for ( k = 0; k < nSet1; k++ )
+            if ( pSet0[i] == pSet1[k] )
+                Counter++;
+    return Counter;
+}
+
+/* 合并两个 cut 的 functional support；串联时把内部输出 root 展开为它自己的 support。 */
+static int If_DualMergeSupports( If_Man_t * p, If_Obj_t * pObj0, If_Cut_t * pCut0, If_Obj_t * pObj1, If_Cut_t * pCut1, int * pLeaves, int Limit, int * pnSupp0, int * pnSupp1, int * pnShared )
+{
+    int Supp0[IF_MAX_LUTSIZE], Supp1[IF_MAX_LUTSIZE], nSupp0 = 0, nSupp1 = 0, nLeaves = 0;
+    if ( !If_DualAddExpandedCutSupport( p, pCut0, pObj1->Id, pCut1, Supp0, &nSupp0, IF_MAX_LUTSIZE ) )
         return Limit + 1;
-    if ( !If_DualAddExpandedCutLeaves( pCut1, pObj0->Id, pCut0, pLeaves, &nLeaves, Limit ) )
+    if ( !If_DualAddExpandedCutSupport( p, pCut1, pObj0->Id, pCut0, Supp1, &nSupp1, IF_MAX_LUTSIZE ) )
+        return Limit + 1;
+    if ( nSupp0 > p->pPars->nDualK || nSupp1 > p->pPars->nDualK )
+        return Limit + 1;
+    if ( If_DualSetIntersectionSize( Supp0, nSupp0, Supp1, nSupp1 ) > p->pPars->nDualS )
+        return Limit + 1;
+    if ( !If_DualAddExpandedCutSupport( p, pCut0, pObj1->Id, pCut1, pLeaves, &nLeaves, Limit ) )
+        return Limit + 1;
+    if ( !If_DualAddExpandedCutSupport( p, pCut1, pObj0->Id, pCut0, pLeaves, &nLeaves, Limit ) )
         return Limit + 1;
     If_DualSortLeaves( pLeaves, nLeaves );
+    *pnSupp0 = nSupp0;
+    *pnSupp1 = nSupp1;
+    *pnShared = If_DualSetIntersectionSize( Supp0, nSupp0, Supp1, nSupp1 );
     return nLeaves;
 }
 
@@ -332,10 +371,9 @@ static float If_DualWindowAreaFlow( If_Man_t * p, If_Cut_t * pCut0, If_Cut_t * p
 /* 检查两个 single cut 是否能形成简单 dual window，并返回展开后的 union leaves/AF。 */
 static int If_DualWindowFeasible( If_Man_t * p, If_Obj_t * pObj0, If_Cut_t * pCut0, int Limit0, If_Obj_t * pObj1, If_Cut_t * pCut1, int Limit1, float * pWindowFlow, int * pLeaves, int * pnLeaves )
 {
-    int nLeaves = If_DualMergeLeaves( pObj0, pCut0, pObj1, pCut1, pLeaves, p->pPars->nLutSize - 1 );
-    /* This implements only the requested simple case: two LUT outputs share
-       one physical dual-LUT input set of at most N-1 data leaves. */
-    if ( nLeaves > p->pPars->nLutSize - 1 )
+    int nSupp0 = 0, nSupp1 = 0, nShared = 0;
+    int nLeaves = If_DualMergeSupports( p, pObj0, pCut0, pObj1, pCut1, pLeaves, p->pPars->nDualI, &nSupp0, &nSupp1, &nShared );
+    if ( nLeaves > p->pPars->nDualI )
         return 0;
     *pWindowFlow = If_DualWindowAreaFlow( p, pCut0, pCut1, pLeaves, nLeaves );
     if ( *pWindowFlow > pCut0->Area + pCut1->Area + p->fEpsilon )
@@ -347,18 +385,6 @@ static int If_DualWindowFeasible( If_Man_t * p, If_Obj_t * pObj0, If_Cut_t * pCu
     (void)Limit1;
     *pnLeaves = nLeaves;
     return 1;
-}
-
-/* 判断 cut 的第 i 个 leaf 是否真的影响该 cut 的输出；truth 缺失时保守认为依赖。 */
-static int If_DualCutLeafDepends( If_Man_t * p, If_Cut_t * pCut, int iLeaf )
-{
-    word * pTruth;
-    if ( iLeaf < 0 || iLeaf >= (int)pCut->nLeaves )
-        return 0;
-    if ( !p->pPars->fTruth || pCut->iCutFunc < 0 || p->vTtMem[pCut->nLeaves] == NULL )
-        return 1;
-    pTruth = If_CutTruthW( p, pCut );
-    return pTruth == NULL ? 1 : Abc_TtHasVar( pTruth, pCut->nLeaves, iLeaf );
 }
 
 /* 计算一个 single/dual 输出的真实逻辑层级。若 cut 里出现 mate 输出，
@@ -413,10 +439,14 @@ static int If_DualComputeCoverDepth( If_Man_t * p )
 static void If_DualAddPair( If_Man_t * p, If_Obj_t * pObj0, If_Obj_t * pObj1, int * pLeaves, int nLeaves )
 {
     If_DualPair_t * pPair = ABC_CALLOC( If_DualPair_t, 1 );
-    int i;
+    int i, DummyLeaves[IF_MAX_LUTSIZE], nSupp0 = 0, nSupp1 = 0, nShared = 0;
     pPair->Obj0 = pObj0->Id;
     pPair->Obj1 = pObj1->Id;
     pPair->nLeaves = nLeaves;
+    If_DualMergeSupports( p, pObj0, If_ObjCutBest(pObj0), pObj1, If_ObjCutBest(pObj1), DummyLeaves, IF_MAX_LUTSIZE, &nSupp0, &nSupp1, &nShared );
+    pPair->nSupp0 = nSupp0;
+    pPair->nSupp1 = nSupp1;
+    pPair->nShared = nShared;
     for ( i = 0; i < nLeaves; i++ )
         pPair->pLeaves[i] = pLeaves[i];
     Vec_PtrPush( p->vIfDualPairs, pPair );
@@ -709,7 +739,7 @@ static int If_DualTryMerge( If_Man_t * p, Vec_Int_t * vLevels, If_Obj_t * pObj, 
     If_Obj_t * pMate, * pBestMate = NULL;
     float BestSaving = 0.0, WindowFlow, BestFlow = 0.0;
     int i, Leaves[IF_MAX_LUTSIZE], BestLeaves[IF_MAX_LUTSIZE], nLeaves = 0, nBestLeaves = 0, Level0, Level1, BestLevel0 = 0, BestLevel1 = 0;
-    if ( !p->pPars->fDualOutput || pObj->fIfLocked || If_ObjCutBest(pObj)->nLeaves > (unsigned)(p->pPars->nLutSize - 1) )
+    if ( !p->pPars->fDualOutput || pObj->fIfLocked )
         return 0;
     Vec_PtrForEachEntry( If_Obj_t *, p->vIfMappedSingles, pMate, i )
     {
@@ -772,7 +802,7 @@ static void If_DualMergePairs( If_Man_t * p, int DepthLimit )
         Vec_IntWriteEntry( vLevels, pObj->Id, If_DualObjLevel(p, vLevels, pObj) );
     Vec_PtrForEachEntry( If_Obj_t *, p->vIfMappedSingles, pObj, i )
     {
-        if ( pObj->fIfLocked || If_ObjCutBest(pObj)->nLeaves > (unsigned)(p->pPars->nLutSize - 1) )
+        if ( pObj->fIfLocked )
             continue;
         nTried++;
         nAccepted += If_DualTryMerge( p, vLevels, pObj, DepthLimit, &nRejected );
@@ -1220,6 +1250,50 @@ static int If_DualEvalHopFunc_rec( Hop_Man_t * pMan, Hop_Obj_t * pRoot, int * pF
     return 1;
 }
 
+static int If_DualEvalSopCube( char * pCube, int * pFanValues, int nVars )
+{
+    int i;
+    for ( i = 0; i < nVars; i++ )
+    {
+        if ( pCube[i] == '0' && pFanValues[i] )
+            return 0;
+        if ( pCube[i] == '1' && !pFanValues[i] )
+            return 0;
+    }
+    return 1;
+}
+
+static int If_DualEvalSop( char * pSop, int * pFanValues, int nVars, int * pValue )
+{
+    char * pCube;
+    if ( pSop == NULL || pSop[0] == 0 || Abc_SopIsConst0(pSop) )
+    {
+        *pValue = 0;
+        return 1;
+    }
+    if ( Abc_SopIsConst1(pSop) )
+    {
+        *pValue = 1;
+        return 1;
+    }
+    for ( pCube = pSop; *pCube; pCube++ )
+    {
+        if ( *pCube != '0' && *pCube != '1' && *pCube != '-' )
+            continue;
+        if ( If_DualEvalSopCube( pCube, pFanValues, nVars ) )
+        {
+            *pValue = 1;
+            return 1;
+        }
+        while ( *pCube && *pCube != '\n' )
+            pCube++;
+        if ( !*pCube )
+            break;
+    }
+    *pValue = 0;
+    return 1;
+}
+
 /* 用当前 network 的函数类型计算一个 mapped node 的局部函数。默认 if -K
    生成 HOP/AIG；若用户显式生成 SOP，也走同一套 fanin 值接口。 */
 static int If_DualEvalAbcNodeFunc( Abc_Ntk_t * pNtkNew, Abc_Obj_t * pObj, int * pFanValues, int nFanins, int * pValue )
@@ -1229,27 +1303,10 @@ static int If_DualEvalAbcNodeFunc( Abc_Ntk_t * pNtkNew, Abc_Obj_t * pObj, int * 
     if ( Abc_NtkHasSop(pNtkNew) )
     {
         char * pSop = (char *)pObj->pData;
-        word Truth;
-        int i, Mint = 0, nVars;
-        if ( pSop == NULL || pSop[0] == 0 || Abc_SopIsConst0(pSop) )
-        {
-            *pValue = 0;
-            return 1;
-        }
-        if ( Abc_SopIsConst1(pSop) )
-        {
-            *pValue = 1;
-            return 1;
-        }
-        nVars = Abc_SopGetVarNum(pSop);
+        int nVars = Abc_SopGetVarNum(pSop);
         if ( nVars < 0 || nVars != nFanins )
             return 0;
-        Truth = Abc_SopToTruth( pSop, nVars );
-        for ( i = 0; i < nFanins; i++ )
-            if ( pFanValues[i] )
-                Mint |= 1 << i;
-        *pValue = (int)((Truth >> Mint) & 1);
-        return 1;
+        return If_DualEvalSop( pSop, pFanValues, nVars, pValue );
     }
     return 0;
 }
@@ -1295,14 +1352,15 @@ static int If_DualEvalAbcConeOnUnion( Abc_Ntk_t * pNtkNew, Abc_Obj_t * pObj, Abc
     return 1;
 }
 
-/* 对最终 ABC cone 做 2^(N-1) 穷举仿真，生成 dual_lutN 参数。 */
+/* 对最终 ABC cone 做 2^N 穷举仿真，生成 dual_lutN 参数。 */
 static int If_DualBuildAbcConeTruthOnUnion( Abc_Ntk_t * pNtkNew, Abc_Obj_t * pObj, Abc_Obj_t ** pLeaves, int nLeaves, word * pTruthUnion )
 {
     Vec_Int_t * vValues, * vMarks;
-    int b, Value, nMints;
-    if ( nLeaves > 6 )
+    int b, Value, nMints, nWords;
+    if ( nLeaves > 8 )
         return 0;
-    *pTruthUnion = 0;
+    nWords = Abc_TtWordNum( nLeaves );
+    memset( pTruthUnion, 0, sizeof(word) * nWords );
     vValues = Vec_IntStart( Abc_NtkObjNumMax(pNtkNew) + 1 );
     vMarks  = Vec_IntStart( Abc_NtkObjNumMax(pNtkNew) + 1 );
     nMints = 1 << nLeaves;
@@ -1339,7 +1397,6 @@ void If_DualTransferAttrs( If_Man_t * pIfMan, void * pNtkNewVoid )
         Abc_Obj_t * pObj1 = (Abc_Obj_t *)If_ObjCopy( If_ManObj( pIfMan, pPair->Obj1 ) );
         Abc_Obj_t * pLeafObjs[IF_MAX_LUTSIZE];
         If_DualAttr_t * pAttr0, * pAttr1;
-        word Truth0 = 0, Truth1 = 0;
         int k;
         if ( pObj0 == NULL || pObj1 == NULL )
             continue;
@@ -1366,18 +1423,16 @@ void If_DualTransferAttrs( If_Man_t * pIfMan, void * pNtkNewVoid )
             continue;
         }
         nPairs++;
-        if ( !If_DualBuildAbcConeTruthOnUnion( pNtkNew, pObj0, pLeafObjs, pPair->nLeaves, &Truth0 ) ||
-             !If_DualBuildAbcConeTruthOnUnion( pNtkNew, pObj1, pLeafObjs, pPair->nLeaves, &Truth1 ) )
+        if ( !If_DualBuildAbcConeTruthOnUnion( pNtkNew, pObj0, pLeafObjs, pPair->nLeaves, pAttr0->uTruth0 ) ||
+             !If_DualBuildAbcConeTruthOnUnion( pNtkNew, pObj1, pLeafObjs, pPair->nLeaves, pAttr0->uTruth1 ) )
         {
             nFailed++;
             ABC_FREE( pAttr0 );
             ABC_FREE( pAttr1 );
             continue;
         }
-        pAttr0->uTruth0 = Truth0;
-        pAttr0->uTruth1 = Truth1;
-        pAttr1->uTruth0 = Truth1;
-        pAttr1->uTruth1 = Truth0;
+        memcpy( pAttr1->uTruth0, pAttr0->uTruth1, sizeof(word) * IF_DUAL_TT_WORDS );
+        memcpy( pAttr1->uTruth1, pAttr0->uTruth0, sizeof(word) * IF_DUAL_TT_WORDS );
         Vec_AttWriteEntry( pAttrs, pObj0->Id, pAttr0 );
         Vec_AttWriteEntry( pAttrs, pObj1->Id, pAttr1 );
     }

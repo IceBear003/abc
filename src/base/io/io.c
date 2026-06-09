@@ -3928,7 +3928,7 @@ int IoCommandWriteVerilog( Abc_Frame_t * pAbc, int argc, char **argv )
                 }
                 nLutSize = atoi(argv[globalUtilOptind]);
                 globalUtilOptind++;
-                if ( nLutSize < 2 || nLutSize > 6 )
+                if ( nLutSize < 2 || nLutSize > 8 )
                     goto usage;
                 break;
             case 'f':
@@ -3961,7 +3961,7 @@ int IoCommandWriteVerilog( Abc_Frame_t * pAbc, int argc, char **argv )
     // get the output file name
     pFileName = argv[globalUtilOptind];
     // call the corresponding file writer
-    if ( nLutSize >= 2 && nLutSize <= 6 )
+    if ( nLutSize >= 2 && nLutSize <= 8 )
         Io_WriteVerilogLut( pAbc->pNtkCur, pFileName, nLutSize, fFixed, fNoModules, fNewInterface );
     else
     {
@@ -3976,7 +3976,7 @@ int IoCommandWriteVerilog( Abc_Frame_t * pAbc, int argc, char **argv )
 usage:
     fprintf( pAbc->Err, "usage: write_verilog [-K num] [-famnh] <file>\n" );
     fprintf( pAbc->Err, "\t         writes the current network in Verilog format\n" );
-    fprintf( pAbc->Err, "\t-K num : write the network using instances of K-LUTs (2 <= K <= 6) [default = not used]\n" );
+    fprintf( pAbc->Err, "\t-K num : write the network using instances of K-LUTs (2 <= K <= 8) [default = not used]\n" );
     fprintf( pAbc->Err, "\t-f     : toggle using fixed format [default = %s]\n", fFixed? "yes":"no" );
     fprintf( pAbc->Err, "\t-a     : toggle writing expressions with only ANDs (without XORs and MUXes) [default = %s]\n", fOnlyAnds? "yes":"no" );
     fprintf( pAbc->Err, "\t-m     : toggle writing additional modules [default = %s]\n", !fNoModules? "yes":"no" );

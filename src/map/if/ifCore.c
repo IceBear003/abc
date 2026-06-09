@@ -66,6 +66,11 @@ void If_ManSetDefaultPars( If_Par_t * pPars )
     pPars->fUserLut2D  =  0;
     pPars->fStrictDepth=  0;
     pPars->fDualOutput =  0;
+    pPars->nDualArch   =  0;
+    pPars->nDualKSingle=  0;
+    pPars->nDualI      =  0;
+    pPars->nDualS      =  0;
+    pPars->nDualK      =  0;
     pPars->fVerbose    =  0;
 }
 

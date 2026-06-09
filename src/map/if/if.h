@@ -59,6 +59,7 @@ ABC_NAMESPACE_HEADER_START
 #define IF_COST_MAX          4095 // ((1<<12)-1)
 
 #define IF_BIG_CHAR ((char)120)
+#define IF_DUAL_TT_WORDS      4
 
 // object types
 typedef enum { 
@@ -157,6 +158,11 @@ struct If_Par_t_
     int                fDumpFile;     // dumping truth tables into a file
     int                fStrictDepth;  // strict max-level dynamic programming
     int                fDualOutput;   // dual-output LUT mapping
+    int                nDualArch;     // dual-output architecture model
+    int                nDualKSingle;  // single-output LUT input width
+    int                nDualI;        // dual-output total input width
+    int                nDualS;        // dual-output shared input width
+    int                nDualK;        // dual-output per-output LUT size
     int                fVerbose;      // the verbosity flag
     int                fVerboseTrace; // the verbosity flag
     char *             pLutStruct;    // LUT structure
@@ -372,6 +378,9 @@ struct If_DualPair_t_
     int                Obj1;          // second output node ID
     int                nLeaves;       // number of union leaves
     int                pLeaves[IF_MAX_LUTSIZE]; // sorted union leaves
+    int                nSupp0;        // functional support size of first output
+    int                nSupp1;        // functional support size of second output
+    int                nShared;       // shared functional support size
 };
 
 // mapped-network attribute attached to paired ABC logic nodes
@@ -381,8 +390,8 @@ struct If_DualAttr_t_
     int                nLutSize;      // physical dual LUT size N
     int                nLeaves;       // number of expanded shared data leaves
     int                pLeaves[IF_MAX_LUTSIZE]; // expanded shared data leaf ABC IDs
-    word               uTruth0;       // truth table for this endpoint over pLeaves
-    word               uTruth1;       // truth table for iMate over pLeaves
+    word               uTruth0[IF_DUAL_TT_WORDS]; // truth table for this endpoint over pLeaves
+    word               uTruth1[IF_DUAL_TT_WORDS]; // truth table for iMate over pLeaves
 };
 
 // set of priority cut

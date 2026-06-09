@@ -52,6 +52,69 @@ static void Io_WriteVerilogDualAttrFree( void * pMan, void * pObj )
     ABC_FREE( pObj );
 }
 
+static void Io_WriteVerilogPrintTruthHex( FILE * pFile, word * pTruth, int nVars )
+{
+    int nWords = Abc_TtWordNum( nVars );
+    int nDigits = Abc_MaxInt( 1, (1 << nVars) / 4 );
+    int i, nTopDigits = nDigits - 16 * (nWords - 1);
+    assert( nVars <= 8 );
+    fprintf( pFile, "%0*llx", nTopDigits, (unsigned long long)pTruth[nWords - 1] );
+    for ( i = nWords - 2; i >= 0; i-- )
+        fprintf( pFile, "%016llx", (unsigned long long)pTruth[i] );
+}
+
+static int Io_WriteVerilogSopEvalCube( char * pCube, int nVars, int Mint )
+{
+    int i;
+    for ( i = 0; i < nVars; i++ )
+    {
+        int Bit = (Mint >> i) & 1;
+        if ( pCube[i] == '0' && Bit )
+            return 0;
+        if ( pCube[i] == '1' && !Bit )
+            return 0;
+    }
+    return 1;
+}
+
+static int Io_WriteVerilogSopToTruth( char * pSop, int nVars, word * pTruth )
+{
+    char * pCube;
+    int Mint, nMints, nWords;
+    if ( nVars < 0 || nVars > 8 )
+        return 0;
+    nWords = Abc_TtWordNum( nVars );
+    memset( pTruth, 0, sizeof(word) * nWords );
+    if ( pSop == NULL || pSop[0] == 0 || Abc_SopIsConst0(pSop) )
+        return 1;
+    if ( Abc_SopIsConst1(pSop) )
+    {
+        Abc_TtFill( pTruth, nWords );
+        return 1;
+    }
+    nMints = 1 << nVars;
+    for ( Mint = 0; Mint < nMints; Mint++ )
+    {
+        for ( pCube = pSop; *pCube; pCube++ )
+        {
+            if ( *pCube != '0' && *pCube != '1' && *pCube != '-' )
+                continue;
+            if ( Io_WriteVerilogSopEvalCube( pCube, nVars, Mint ) )
+            {
+                Abc_TtSetBit( pTruth, Mint );
+                break;
+            }
+            while ( *pCube && *pCube != '\n' )
+                pCube++;
+            if ( !*pCube )
+                break;
+        }
+    }
+    if ( Abc_SopIsComplement(pSop) )
+        Abc_TtNot( pTruth, nWords );
+    return 1;
+}
+
 static int Io_WriteVerilogLutHasDualAttrs( Abc_Ntk_t * pNtk )
 {
     return pNtk && pNtk->vAttrs && Vec_PtrEntry(pNtk->vAttrs, VEC_ATTR_DATA1) != NULL;
@@ -125,8 +188,8 @@ static void Io_WriteVerilogLutTransferDualAttrs( Abc_Ntk_t * pNtk, Abc_Ntk_t * p
         pNew->iMate = ((Abc_Obj_t *)pMate->pCopy)->Id;
         pNew->nLutSize = pOld->nLutSize;
         pNew->nLeaves = pOld->nLeaves;
-        pNew->uTruth0 = pOld->uTruth0;
-        pNew->uTruth1 = pOld->uTruth1;
+        memcpy( pNew->uTruth0, pOld->uTruth0, sizeof(word) * IF_DUAL_TT_WORDS );
+        memcpy( pNew->uTruth1, pOld->uTruth1, sizeof(word) * IF_DUAL_TT_WORDS );
         for ( k = 0; k < pOld->nLeaves; k++ )
         {
             Abc_Obj_t * pLeaf = Abc_NtkObj( pNtk, pOld->pLeaves[k] );
@@ -909,15 +972,14 @@ void Io_WriteLutModule( FILE * pFile, int nLutSize )
 }
 void Io_WriteDualLutModule( FILE * pFile, int nLutSize )
 {
-    int nSmall = nLutSize - 1;
     fprintf( pFile, "module dual_lut%d ( in, z5, z );\n", nLutSize );
-    fprintf( pFile, "    parameter TT_Z5 = %d\'h0;\n", 1 << nSmall );
-    fprintf( pFile, "    parameter TT_Z = %d\'h0;\n", 1 << nSmall );
+    fprintf( pFile, "    parameter TT_Z5 = %d\'h0;\n", 1 << nLutSize );
+    fprintf( pFile, "    parameter TT_Z = %d\'h0;\n", 1 << nLutSize );
     fprintf( pFile, "    input [%d:0] in;\n", nLutSize - 1 );
     fprintf( pFile, "    output z5;\n" );
     fprintf( pFile, "    output z;\n" );
-    fprintf( pFile, "    wire o0 = TT_Z5[in[%d:0]];\n", nSmall - 1 );
-    fprintf( pFile, "    wire o1 = TT_Z[in[%d:0]];\n", nSmall - 1 );
+    fprintf( pFile, "    wire o0 = TT_Z5[in];\n" );
+    fprintf( pFile, "    wire o1 = TT_Z[in];\n" );
     fprintf( pFile, "    assign z5 = o0;\n" );
     fprintf( pFile, "    assign z = o1;\n" );
     fprintf( pFile, "endmodule\n\n" );
@@ -1033,7 +1095,7 @@ void Io_WriteVerilogObjectsLut( FILE * pFile, Abc_Ntk_t * pNtk, int nLutSize, in
         {
             Abc_Obj_t * pMate = Abc_NtkObj( pNtk, pDual->iMate );
             Abc_Obj_t * pFanins[IF_MAX_LUTSIZE];
-            int nUnion = 0, m, nDigitsHex;
+            int nUnion = 0, m;
             char NameOut0[500], NameOut1[500];
             /* Be conservative at the writer boundary.  If the mate disappeared
                during temporary-network construction, or if both endpoints map
@@ -1059,41 +1121,52 @@ void Io_WriteVerilogObjectsLut( FILE * pFile, Abc_Ntk_t * pNtk, int nLutSize, in
                 if ( pFanins[k] == NULL )
                     goto IoWriteSingleLut;
             }
-            /* The hardware model is two (N-1)-input LUTs sharing the same data
-               inputs plus a fixed select input.  Larger unions are outside the
-               implemented simple dual-output case. */
-            if ( nUnion > nLutSize - 1 )
+            if ( nUnion > nLutSize || nUnion > 8 )
                 goto IoWriteSingleLut;
-            /* The mapper has already simulated the two accepted cones over this
-               union-leaf order, so the writer only serializes the stored TT. */
-            nDigitsHex = Abc_MaxInt( 1, 1 << (nLutSize - 3) );
-            fprintf( pFile, "  dual_lut%d #(%d\'h%0*llx, %d\'h%0*llx) dual_%0*d ( {", nLutSize,
-                1 << (nLutSize - 1), nDigitsHex, (unsigned long long)pDual->uTruth0,
-                1 << (nLutSize - 1), nDigitsHex, (unsigned long long)pDual->uTruth1, nDigits, Counter++ );
-            fprintf( pFile, "%*s", Length, "1\'b1" );
-            for ( m = nLutSize - 2; m >= nUnion; m-- )
-                fprintf( pFile, ", %*s", Length, "1\'b0" );
-            for ( m = nUnion - 1; m >= 0; m-- )
-                fprintf( pFile, ", %*s", Length, Io_WriteVerilogGetName(Abc_ObjName(pFanins[m])) );
+            fprintf( pFile, "  dual_lut%d #(%d\'h", nLutSize, 1 << nLutSize );
+            Io_WriteVerilogPrintTruthHex( pFile, pDual->uTruth0, nLutSize );
+            fprintf( pFile, ", %d\'h", 1 << nLutSize );
+            Io_WriteVerilogPrintTruthHex( pFile, pDual->uTruth1, nLutSize );
+            fprintf( pFile, ") dual_%0*d ( {", nDigits, Counter++ );
+            for ( m = nLutSize - 1; m >= 0; m-- )
+            {
+                if ( m != nLutSize - 1 )
+                    fprintf( pFile, ", " );
+                if ( m >= nUnion )
+                    fprintf( pFile, "%*s", Length, "1\'b0" );
+                else
+                    fprintf( pFile, "%*s", Length, Io_WriteVerilogGetName(Abc_ObjName(pFanins[m])) );
+            }
             fprintf( pFile, "}, %*s, %*s );\n", Length, NameOut0, Length, NameOut1 );
             Vec_IntWriteEntry( vPrinted, pObj->Id, 1 );
             Vec_IntWriteEntry( vPrinted, pMate->Id, 1 );
             continue;
         }
     IoWriteSingleLut:
-        word Truth = Abc_SopToTruth( (char *)pObj->pData, Abc_ObjFaninNum(pObj) );
+    {
+        word Truth[IF_DUAL_TT_WORDS];
+        if ( Abc_ObjFaninNum(pObj) <= 6 )
+        {
+            Truth[0] = Abc_SopToTruth( (char *)pObj->pData, Abc_ObjFaninNum(pObj) );
+            Truth[1] = Truth[2] = Truth[3] = 0;
+        }
+        else if ( !Io_WriteVerilogSopToTruth( (char *)pObj->pData, Abc_ObjFaninNum(pObj), Truth ) )
+            continue;
         fprintf( pFile, "  lut%d #(%d\'h", nLutSize, 1<<nLutSize );
-        if ( nLutSize == 6 )
-            fprintf( pFile, "%08x%08x", (unsigned)(Truth >> 32), (unsigned)Truth );
-        else
-            fprintf( pFile, "%0*x", 1<<(nLutSize-2), Abc_InfoMask(1 << nLutSize) & (unsigned)Truth );
+        Io_WriteVerilogPrintTruthHex( pFile, Truth, nLutSize );
         fprintf( pFile, ") lut_%0*d ( {", nDigits, Counter++ );
-        for ( k = nLutSize - 1; k >= Abc_ObjFaninNum(pObj); k-- )
-            fprintf( pFile, "%*s, ", Length, "1\'b0" );
-        for ( k = Abc_ObjFaninNum(pObj) - 1; k >= 0; k-- )
-            fprintf( pFile, "%*s%s", Length, Io_WriteVerilogGetName(Abc_ObjName(Abc_ObjFanin(pObj, k))), k==0 ? "":", " );
+        for ( k = nLutSize - 1; k >= 0; k-- )
+        {
+            if ( k != nLutSize - 1 )
+                fprintf( pFile, ", " );
+            if ( k >= Abc_ObjFaninNum(pObj) )
+                fprintf( pFile, "%*s", Length, "1\'b0" );
+            else
+                fprintf( pFile, "%*s", Length, Io_WriteVerilogGetName(Abc_ObjName(Abc_ObjFanin(pObj, k))) );
+        }
         fprintf( pFile, "}, %*s );\n", Length, Io_WriteVerilogGetName(Abc_ObjName(Abc_ObjFanout0(pObj))) );
         Vec_IntWriteEntry( vPrinted, pObj->Id, 1 );
+    }
     }
     Vec_IntFree( vPrinted );
     }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run ABC CEC for original benchmarks against baseline/strict/dual LUT outputs."""
+"""Run ABC CEC for original benchmarks against architecture-aware baseline/dual LUT outputs."""
 
 from __future__ import annotations
 
@@ -30,6 +30,11 @@ CONST_RE = re.compile(r"(?:(?P<bits>\d+)\s*)?'(?P<base>[bBdDhH])(?P<value>[0-9a-
 CEC_PASS_RE = re.compile(r"Networks are equivalent|Networks are combinationally equivalent", re.IGNORECASE)
 CEC_FAIL_RE = re.compile(r"Networks are NOT EQUIVALENT|are not equivalent|not equivalent", re.IGNORECASE)
 CEC_READ_ERROR_RE = re.compile(r"Reading network from file has failed|Network contains a combinational loop|NetworkCheck:", re.IGNORECASE)
+ARCH_CONFIGS = {
+    "ultrascale": {"Ksingle": 6, "Idual": 5, "Isharing": 5, "Kdual": 5},
+    "versal": {"Ksingle": 6, "Idual": 6, "Isharing": 6, "Kdual": 6},
+    "alm": {"Ksingle": 8, "Idual": 8, "Isharing": 4, "Kdual": 6},
+}
 
 
 def split_csv(text: str) -> list[str]:
@@ -37,7 +42,6 @@ def split_csv(text: str) -> list[str]:
 
 
 def clean_name(sig: str) -> str:
-    """Convert ABC escaped Verilog names into the BLIF names ABC writes itself."""
     sig = sig.strip()
     if sig.startswith("\\"):
         sig = sig[1:]
@@ -68,6 +72,53 @@ def parse_hex_const(text: str) -> int:
         raise ValueError(f"unsupported unknown truth-table constant: {text}")
     base = m.group("base").lower()
     return int(value, {"b": 2, "d": 10, "h": 16}[base])
+
+
+def truth_const_width(text: str) -> int:
+    text = text.strip()
+    m = CONST_RE.fullmatch(text)
+    if not m or m.group("plain") is not None:
+        raise ValueError(f"expected sized Verilog constant, got: {text}")
+    bits = m.group("bits")
+    if bits is not None:
+        return int(bits)
+    value = m.group("value").replace("_", "")
+    base = m.group("base").lower()
+    if base == "b":
+        return len(value)
+    if base == "h":
+        return 4 * len(value)
+    return max(1, int(value, 10).bit_length())
+
+
+def dual_output_specs(src: Path, width: int, params: list[str], terms: list[str], out0: str, out1: str) -> list[tuple[str, list[str], int, int]]:
+    if len(params) != 2:
+        raise ValueError(f"{src}: dual_lut{width} expects two truth-table parameters")
+    if len(terms) != width:
+        raise ValueError(f"{src}: dual_lut{width} has {len(terms)} inputs")
+    tt0 = parse_hex_const(params[0])
+    tt1 = parse_hex_const(params[1])
+    bits0 = truth_const_width(params[0])
+    bits1 = truth_const_width(params[1])
+    if bits0 != bits1:
+        raise ValueError(f"{src}: dual_lut{width} mixes truth-table widths {bits0} and {bits1}")
+    new_bits = 1 << width
+    old_bits = 1 << (width - 1) if width > 0 else 1
+    if bits0 == new_bits:
+        return [
+            (clean_name(out0), terms, tt0, width),
+            (clean_name(out1), terms, tt1, width),
+        ]
+    if width > 0 and bits0 == old_bits:
+        legacy_terms = terms[1:]
+        return [
+            (clean_name(out0), legacy_terms, tt0, width - 1),
+            (clean_name(out1), legacy_terms, tt1, width - 1),
+        ]
+    raise ValueError(
+        f"{src}: dual_lut{width} truth tables must have {new_bits} bits (new format) "
+        f"or {old_bits} bits (legacy format), got {bits0}"
+    )
 
 
 def find_top_module(text: str) -> tuple[str, str]:
@@ -106,7 +157,6 @@ def blif_wrap(kind: str, names: list[str]) -> list[str]:
 
 
 def truth_rows(input_terms: list[str], tt: int, width: int) -> tuple[list[str], list[str]]:
-    """Return BLIF variables and onset rows for TT indexed as Verilog TT[in]."""
     vars_seen: list[str] = []
     term_to_var: list[tuple[str | None, int | None]] = []
     for term in input_terms:
@@ -133,9 +183,6 @@ def truth_rows(input_terms: list[str], tt: int, width: int) -> tuple[list[str], 
                 full_index |= 1 << (width - 1 - pos)
         return (tt >> full_index) & 1
 
-    # Drop functionally unused inputs before writing BLIF.  ABC checks for
-    # combinational loops while reading BLIF, so redundant structural fanins can
-    # create false read errors even when the truth table ignores them.
     support: list[str] = []
     n_all = len(vars_seen)
     for i_var, name in enumerate(vars_seen):
@@ -183,21 +230,10 @@ def mapped_verilog_to_blif(src: Path, dst: Path) -> None:
     for m in DUAL_INST_RE.finditer(body):
         width = int(m.group("n"))
         params = split_csv(m.group("params"))
-        if len(params) != 2:
-            raise ValueError(f"{src}: dual_lut{width} expects two truth-table parameters")
         terms = split_csv(m.group("inputs"))
-        if len(terms) != width:
-            raise ValueError(f"{src}: dual_lut{width} has {len(terms)} inputs")
-        z5_terms = terms[1:]
-        z5_tt = parse_hex_const(params[0])
-        z_tt = parse_hex_const(params[1])
-        vars_seen, rows = truth_rows(z5_terms, z5_tt, width - 1)
-        emit_names(lines, vars_seen, m.group("z5"), rows)
-
-        # The emitted dual_lutN keeps the physical select pin for pin counting,
-        # but z is the second (N-1)-input LUT output and does not depend on it.
-        z_vars, z_rows = truth_rows(z5_terms, z_tt, width - 1)
-        emit_names(lines, z_vars, m.group("z"), z_rows)
+        for out_name, out_terms, tt, tt_width in dual_output_specs(src, width, params, terms, m.group("z5"), m.group("z")):
+            vars_seen, rows = truth_rows(out_terms, tt, tt_width)
+            emit_names(lines, vars_seen, out_name, rows)
 
     lines.append(".end")
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -247,13 +283,36 @@ def cec_status(retcode: int, log: str) -> str:
     return "unknown"
 
 
-def run_case(abc: Path, mapped_dir: Path, out_dir: Path, src: Path, bench_dir: Path, mode: str, stream: bool) -> dict[str, str]:
+def run_case(
+    abc: Path,
+    mapped_dir: Path,
+    out_dir: Path,
+    src: Path,
+    bench_dir: Path,
+    arch: str,
+    mode: str,
+    stream: bool,
+) -> dict[str, str]:
     rel = src.relative_to(bench_dir)
     stem = rel.with_suffix("")
-    mapped = mapped_dir / mode / f"{stem}.v"
-    blif = out_dir / "blif" / mode / f"{stem}.blif"
-    log_path = out_dir / "logs" / mode / f"{stem}.log"
-    row = {"design": str(rel), "mode": mode, "mapped": str(mapped), "blif": str(blif)}
+    mapped = mapped_dir / arch / mode / f"{stem}.v"
+    if not mapped.exists():
+        legacy_mapped = mapped_dir / mode / f"{stem}.v"
+        if legacy_mapped.exists():
+            mapped = legacy_mapped
+    blif = out_dir / "blif" / arch / mode / f"{stem}.blif"
+    log_path = out_dir / "logs" / arch / mode / f"{stem}.log"
+    row = {
+        "design": str(rel),
+        "arch": arch,
+        "mode": mode,
+        "Ksingle": str(ARCH_CONFIGS[arch]["Ksingle"]),
+        "Idual": str(ARCH_CONFIGS[arch]["Idual"]),
+        "Isharing": str(ARCH_CONFIGS[arch]["Isharing"]),
+        "Kdual": str(ARCH_CONFIGS[arch]["Kdual"]),
+        "mapped": str(mapped),
+        "blif": str(blif),
+    }
     if not mapped.exists():
         row.update({"status": "missing", "runtime_sec": "0.000"})
         return row
@@ -280,16 +339,18 @@ def run_case(abc: Path, mapped_dir: Path, out_dir: Path, src: Path, bench_dir: P
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--abc", type=Path, default=Path("./abc"))
-    parser.add_argument("--bench-dir", type=Path, default=Path("benchmarks-master"))
+    parser.add_argument("--bench-dir", type=Path, default=Path("benchmarks/tested"))
     parser.add_argument("--mapped-dir", type=Path, default=Path("if_dual_results"))
     parser.add_argument("--out-dir", type=Path, default=Path("if_dual_cec"))
     parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--arch", choices=["ultrascale", "versal", "alm", "all"], default="all")
     parser.add_argument("--mode", choices=["baseline", "strict", "dual"], action="append")
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
 
-    modes = args.mode or ["baseline", "strict", "dual"]
+    archs = list(ARCH_CONFIGS) if args.arch == "all" else [args.arch]
+    modes = args.mode or ["baseline", "dual"]
     benches = sorted(args.bench_dir.rglob("*.v"))
     if not benches:
         print(f"no Verilog benchmarks found under {args.bench_dir}")
@@ -299,37 +360,47 @@ def main() -> int:
     if args.jobs == 1:
         for src in benches:
             rel = src.relative_to(args.bench_dir)
-            for mode in modes:
-                print(f"\n===== CEC {rel} [{mode}] start =====", flush=True)
-                row = run_case(args.abc, args.mapped_dir, args.out_dir, src, args.bench_dir, mode, True)
-                rows.append(row)
-                if row["status"] == "missing":
-                    print(f"missing mapped Verilog: {row['mapped']}")
-                elif row["status"] == "convert_error":
-                    print(f"conversion failed: {row.get('message', '')}")
-                print(f"===== CEC {rel} [{mode}] {row['status']} in {float(row['runtime_sec']):.2f}s =====\n", flush=True)
+            for arch in archs:
+                for mode in modes:
+                    print(f"\n===== CEC {rel} [{arch}/{mode}] start =====", flush=True)
+                    row = run_case(args.abc, args.mapped_dir, args.out_dir, src, args.bench_dir, arch, mode, True)
+                    rows.append(row)
+                    if row["status"] == "missing":
+                        print(f"missing mapped Verilog: {row['mapped']}")
+                    elif row["status"] == "convert_error":
+                        print(f"conversion failed: {row.get('message', '')}")
+                    print(f"===== CEC {rel} [{arch}/{mode}] {row['status']} in {float(row['runtime_sec']):.2f}s =====\n", flush=True)
     else:
-        jobs = [(src, mode) for src in benches for mode in modes]
+        jobs = [(src, arch, mode) for src in benches for arch in archs for mode in modes]
         print(f"running {len(jobs)} CEC jobs with {args.jobs} workers", flush=True)
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
             future_to_job = {
-                executor.submit(run_case, args.abc, args.mapped_dir, args.out_dir, src, args.bench_dir, mode, False): (src, mode)
-                for src, mode in jobs
+                executor.submit(run_case, args.abc, args.mapped_dir, args.out_dir, src, args.bench_dir, arch, mode, False): (src, arch, mode)
+                for src, arch, mode in jobs
             }
             for future in concurrent.futures.as_completed(future_to_job):
-                src, mode = future_to_job[future]
+                src, arch, mode = future_to_job[future]
                 rel = src.relative_to(args.bench_dir)
                 row = future.result()
                 rows.append(row)
-                print(f"===== CEC {rel} [{mode}] {row['status']} in {float(row['runtime_sec']):.2f}s =====", flush=True)
+                print(f"===== CEC {rel} [{arch}/{mode}] {row['status']} in {float(row['runtime_sec']):.2f}s =====", flush=True)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     summary = args.out_dir / "cec_summary.csv"
-    fields = ["design", "mode", "status", "runtime_sec", "mapped", "blif", "log", "message"]
+    fields = ["design", "arch", "mode", "Ksingle", "Idual", "Isharing", "Kdual", "status", "runtime_sec", "mapped", "blif", "log", "message"]
     with summary.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(sorted(rows, key=lambda row: (row["design"], modes.index(row["mode"]) if row["mode"] in modes else len(modes))))
+        writer.writerows(
+            sorted(
+                rows,
+                key=lambda row: (
+                    row["design"],
+                    archs.index(row["arch"]) if row["arch"] in archs else len(archs),
+                    modes.index(row["mode"]) if row["mode"] in modes else len(modes),
+                ),
+            )
+        )
     bad = [r for r in rows if r.get("status") != "pass"]
     print(f"wrote {summary}")
     if bad:
