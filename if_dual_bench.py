@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import os
 import shutil
 import re
 import shlex
@@ -197,7 +198,16 @@ def stats_from_verilog(path: Path, lut_size: int) -> dict[str, int]:
     return result
 
 
-def run_abc(abc: Path, src: Path, out: Path, lut_size: int, if_opts: str, stream: bool = True) -> tuple[str, float]:
+def wait_with_rusage(proc: subprocess.Popen[str]) -> tuple[int, int | None]:
+    if hasattr(os, "wait4"):
+        pid, status, rusage = os.wait4(proc.pid, 0)
+        assert pid == proc.pid
+        proc.returncode = os.waitstatus_to_exitcode(status)
+        return proc.returncode, rusage.ru_maxrss
+    return proc.wait(), None
+
+
+def run_abc(abc: Path, src: Path, out: Path, lut_size: int, if_opts: str, stream: bool = True) -> tuple[str, float, int | None]:
     out.parent.mkdir(parents=True, exist_ok=True)
     # Keep preprocessing identical across modes so the CSV compares only the
     # mapper options: baseline, strict-depth, and dual-output.
@@ -213,18 +223,21 @@ def run_abc(abc: Path, src: Path, out: Path, lut_size: int, if_opts: str, stream
         argv = ["stdbuf", "-oL", "-eL"] + argv
     start = time.perf_counter()
     if not stream:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             argv,
             cwd=abc.parent,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
+        assert proc.stdout is not None
+        stdout = proc.stdout.read()
+        retcode, max_rss_kb = wait_with_rusage(proc)
         elapsed = time.perf_counter() - start
-        log = proc.stdout or ""
-        if proc.returncode != 0 or not out.exists():
+        log = stdout or ""
+        if retcode != 0 or not out.exists():
             raise RuntimeError(f"ABC failed for {src} [{if_opts}]\n{log}")
-        return log, elapsed
+        return log, elapsed, max_rss_kb
     proc = subprocess.Popen(
         argv,
         cwd=abc.parent,
@@ -238,23 +251,24 @@ def run_abc(abc: Path, src: Path, out: Path, lut_size: int, if_opts: str, stream
         chunks.append(chunk)
         sys.stdout.write(chunk)
         sys.stdout.flush()
-    retcode = proc.wait()
+    retcode, max_rss_kb = wait_with_rusage(proc)
     elapsed = time.perf_counter() - start
     log = "".join(chunks)
     if retcode != 0 or not out.exists():
         raise RuntimeError(f"ABC failed for {src} [{if_opts}]\n{log}")
-    return log, elapsed
+    return log, elapsed, max_rss_kb
 
 
 def run_job(abc: Path, bench_dir: Path, out_dir: Path, src: Path, lut_size: int, mode: str, if_opts: str, stream: bool) -> dict[str, str]:
     rel = src.relative_to(bench_dir)
     stem = rel.with_suffix("")
     out = out_dir / mode / f"{stem}.v"
-    log, elapsed = run_abc(abc.resolve(), src.resolve(), out, lut_size, if_opts, stream=stream)
+    log, elapsed, max_rss_kb = run_abc(abc.resolve(), src.resolve(), out, lut_size, if_opts, stream=stream)
     log_path = out_dir / mode / f"{stem}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(log)
     row = {"design": str(rel), "mode": mode, "verilog": str(out), "runtime_sec": f"{elapsed:.3f}"}
+    row["max_rss_kb"] = "" if max_rss_kb is None else str(max_rss_kb)
     row.update(stats_from_verilog(out, lut_size))
     return row
 
@@ -309,6 +323,7 @@ def main() -> int:
         baseline_luts = int(baseline_row["total_luts"]) if baseline_row else 0
         baseline_time = float(baseline_row["runtime_sec"]) if baseline_row else 0.0
         mode_times = {row["mode"]: float(row["runtime_sec"]) for row in design_rows}
+        mode_rss = {row["mode"]: row.get("max_rss_kb", "") for row in design_rows}
         for row in sorted(design_rows, key=lambda row: mode_order.get(row["mode"], len(mode_order))):
             total_luts = int(row["total_luts"])
             runtime = float(row["runtime_sec"])
@@ -325,14 +340,17 @@ def main() -> int:
         runtime_rows.append({
             "design": design,
             "baseline_sec": f"{mode_times.get('baseline', 0.0):.3f}",
+            "baseline_rss_kb": mode_rss.get("baseline", ""),
             "strict_sec": f"{mode_times.get('strict', 0.0):.3f}",
+            "strict_rss_kb": mode_rss.get("strict", ""),
             "dual_sec": f"{mode_times.get('dual', 0.0):.3f}",
+            "dual_rss_kb": mode_rss.get("dual", ""),
             "strict_runtime_scale": f"{mode_times.get('strict', 0.0) / mode_times['baseline']:.3f}" if mode_times.get("baseline", 0.0) > 0 else "",
             "dual_runtime_scale": f"{mode_times.get('dual', 0.0) / mode_times['baseline']:.3f}" if mode_times.get("baseline", 0.0) > 0 else "",
             "total_sec": f"{sum(mode_times.values()):.3f}",
         })
 
-    fieldnames = ["design", "mode", "verilog", "runtime_sec"] + [f"LUT{i}" for i in range(1, args.lut_size + 1)] + [
+    fieldnames = ["design", "mode", "verilog", "runtime_sec", "max_rss_kb"] + [f"LUT{i}" for i in range(1, args.lut_size + 1)] + [
         f"dual_lut{args.lut_size}",
         "total_luts",
         "area_saved_percent",
@@ -347,7 +365,7 @@ def main() -> int:
         writer.writeheader()
         writer.writerows(rows)
     with (args.out_dir / "runtime_summary.csv").open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["design", "baseline_sec", "strict_sec", "dual_sec", "strict_runtime_scale", "dual_runtime_scale", "total_sec"])
+        writer = csv.DictWriter(f, fieldnames=["design", "baseline_sec", "baseline_rss_kb", "strict_sec", "strict_rss_kb", "dual_sec", "dual_rss_kb", "strict_runtime_scale", "dual_runtime_scale", "total_sec"])
         writer.writeheader()
         writer.writerows(runtime_rows)
     print(f"wrote {args.out_dir / 'summary.csv'}")
