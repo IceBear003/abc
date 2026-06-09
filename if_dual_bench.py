@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import shutil
 import re
@@ -17,6 +18,11 @@ from pathlib import Path
 SINGLE_RE = re.compile(r"\s+lut(?P<n>\d+)\s*#\((?P<tt>[^)]*)\)\s+\S+\s*\(\s*\{(?P<inputs>[^}]*)\}\s*,\s*(?P<out>[^)]+?)\s*\)\s*;")
 DUAL_RE = re.compile(r"\s+dual_lut(?P<n>\d+)\s*#\((?P<params>[^)]*)\)\s+\S+\s*\(\s*\{(?P<inputs>[^}]*)\}\s*,\s*(?P<z5>[^,]+?)\s*,\s*(?P<z>[^)]+?)\s*\)\s*;")
 CONST_RE = re.compile(r"(?:(?P<bits>\d+)\s*)?'(?P<base>[bBdDhH])(?P<value>[0-9a-fA-F_xzXZ]+)|(?P<plain>[01])")
+MODES = [
+    ("baseline", ""),
+    # ("strict", "-L"),
+    ("dual", "-P"),
+]
 
 
 def split_signals(text: str) -> list[str]:
@@ -191,7 +197,7 @@ def stats_from_verilog(path: Path, lut_size: int) -> dict[str, int]:
     return result
 
 
-def run_abc(abc: Path, src: Path, out: Path, lut_size: int, if_opts: str) -> tuple[str, float]:
+def run_abc(abc: Path, src: Path, out: Path, lut_size: int, if_opts: str, stream: bool = True) -> tuple[str, float]:
     out.parent.mkdir(parents=True, exist_ok=True)
     # Keep preprocessing identical across modes so the CSV compares only the
     # mapper options: baseline, strict-depth, and dual-output.
@@ -206,6 +212,19 @@ def run_abc(abc: Path, src: Path, out: Path, lut_size: int, if_opts: str) -> tup
     if shutil.which("stdbuf"):
         argv = ["stdbuf", "-oL", "-eL"] + argv
     start = time.perf_counter()
+    if not stream:
+        proc = subprocess.run(
+            argv,
+            cwd=abc.parent,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        elapsed = time.perf_counter() - start
+        log = proc.stdout or ""
+        if proc.returncode != 0 or not out.exists():
+            raise RuntimeError(f"ABC failed for {src} [{if_opts}]\n{log}")
+        return log, elapsed
     proc = subprocess.Popen(
         argv,
         cwd=abc.parent,
@@ -227,47 +246,70 @@ def run_abc(abc: Path, src: Path, out: Path, lut_size: int, if_opts: str) -> tup
     return log, elapsed
 
 
+def run_job(abc: Path, bench_dir: Path, out_dir: Path, src: Path, lut_size: int, mode: str, if_opts: str, stream: bool) -> dict[str, str]:
+    rel = src.relative_to(bench_dir)
+    stem = rel.with_suffix("")
+    out = out_dir / mode / f"{stem}.v"
+    log, elapsed = run_abc(abc.resolve(), src.resolve(), out, lut_size, if_opts, stream=stream)
+    log_path = out_dir / mode / f"{stem}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(log)
+    row = {"design": str(rel), "mode": mode, "verilog": str(out), "runtime_sec": f"{elapsed:.3f}"}
+    row.update(stats_from_verilog(out, lut_size))
+    return row
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--abc", type=Path, default=Path("./abc"))
     parser.add_argument("--bench-dir", type=Path, default=Path("benchmarks/tested"))
     parser.add_argument("--out-dir", type=Path, default=Path("if_dual_results"))
+    parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("-K", "--lut-size", type=int, default=6)
     args = parser.parse_args()
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
 
     benches = sorted(args.bench_dir.rglob("*.v"))
     if not benches:
         print(f"no Verilog benchmarks found under {args.bench_dir}")
         return 0
 
-    modes = [
-        ("baseline", ""),
-        # ("strict", "-L"),
-        ("dual", "-P"),
-    ]
+    results_by_design: dict[str, dict[str, dict[str, str]]] = {}
+    if args.jobs == 1:
+        for src in benches:
+            rel = src.relative_to(args.bench_dir)
+            results_by_design.setdefault(str(rel), {})
+            for mode, if_opts in MODES:
+                print(f"\n===== {rel} [{mode}] start =====", flush=True)
+                row = run_job(args.abc, args.bench_dir, args.out_dir, src, args.lut_size, mode, if_opts, stream=True)
+                results_by_design[str(rel)][mode] = row
+                print(f"===== {rel} [{mode}] done in {float(row['runtime_sec']):.2f}s =====\n", flush=True)
+    else:
+        jobs = [(src, mode, if_opts) for src in benches for mode, if_opts in MODES]
+        print(f"running {len(jobs)} ABC jobs with {args.jobs} workers", flush=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
+            future_to_job = {
+                executor.submit(run_job, args.abc, args.bench_dir, args.out_dir, src, args.lut_size, mode, if_opts, False): (src, mode)
+                for src, mode, if_opts in jobs
+            }
+            for future in concurrent.futures.as_completed(future_to_job):
+                src, mode = future_to_job[future]
+                rel = src.relative_to(args.bench_dir)
+                row = future.result()
+                results_by_design.setdefault(str(rel), {})[mode] = row
+                print(f"===== {rel} [{mode}] done in {float(row['runtime_sec']):.2f}s =====", flush=True)
+
+    mode_order = {mode: i for i, (mode, _) in enumerate(MODES)}
     rows = []
     runtime_rows = []
-    for src in benches:
-        rel = src.relative_to(args.bench_dir)
-        stem = rel.with_suffix("")
-        design_start = time.perf_counter()
-        mode_times = {}
-        design_rows = []
-        for mode, if_opts in modes:
-            out = args.out_dir / mode / f"{stem}.v"
-            print(f"\n===== {rel} [{mode}] start =====", flush=True)
-            log, elapsed = run_abc(args.abc.resolve(), src.resolve(), out, args.lut_size, if_opts)
-            print(f"===== {rel} [{mode}] done in {elapsed:.2f}s =====\n", flush=True)
-            mode_times[mode] = elapsed
-            (args.out_dir / mode / f"{stem}.log").parent.mkdir(parents=True, exist_ok=True)
-            (args.out_dir / mode / f"{stem}.log").write_text(log)
-            row = {"design": str(rel), "mode": mode, "verilog": str(out), "runtime_sec": f"{elapsed:.3f}"}
-            row.update(stats_from_verilog(out, args.lut_size))
-            design_rows.append(row)
+    for design in sorted(results_by_design):
+        design_rows = [results_by_design[design][mode] for mode, _ in MODES if mode in results_by_design[design]]
         baseline_row = next((row for row in design_rows if row["mode"] == "baseline"), None)
         baseline_luts = int(baseline_row["total_luts"]) if baseline_row else 0
-        baseline_time = mode_times.get("baseline", 0.0)
-        for row in design_rows:
+        baseline_time = float(baseline_row["runtime_sec"]) if baseline_row else 0.0
+        mode_times = {row["mode"]: float(row["runtime_sec"]) for row in design_rows}
+        for row in sorted(design_rows, key=lambda row: mode_order.get(row["mode"], len(mode_order))):
             total_luts = int(row["total_luts"])
             runtime = float(row["runtime_sec"])
             if row["mode"] == "baseline":
@@ -281,13 +323,13 @@ def main() -> int:
                 row["runtime_scale"] = ""
             rows.append(row)
         runtime_rows.append({
-            "design": str(rel),
+            "design": design,
             "baseline_sec": f"{mode_times.get('baseline', 0.0):.3f}",
             "strict_sec": f"{mode_times.get('strict', 0.0):.3f}",
             "dual_sec": f"{mode_times.get('dual', 0.0):.3f}",
             "strict_runtime_scale": f"{mode_times.get('strict', 0.0) / mode_times['baseline']:.3f}" if mode_times.get("baseline", 0.0) > 0 else "",
             "dual_runtime_scale": f"{mode_times.get('dual', 0.0) / mode_times['baseline']:.3f}" if mode_times.get("baseline", 0.0) > 0 else "",
-            "total_sec": f"{time.perf_counter() - design_start:.3f}",
+            "total_sec": f"{sum(mode_times.values()):.3f}",
         })
 
     fieldnames = ["design", "mode", "verilog", "runtime_sec"] + [f"LUT{i}" for i in range(1, args.lut_size + 1)] + [
