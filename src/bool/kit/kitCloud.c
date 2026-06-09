@@ -41,6 +41,22 @@ struct Kit_Mux_t_
 static inline int        Kit_Mux2Int( Kit_Mux_t m )  { union { Kit_Mux_t x; int y; } v; v.x = m; return v.y;  }
 static inline Kit_Mux_t  Kit_Int2Mux( int m )        { union { Kit_Mux_t x; int y; } v; v.y = m; return v.x;  }
 
+static unsigned Kit_TruthToCloud5Normalize( unsigned uTruth, int nVars )
+{
+    unsigned uNorm = 0;
+    int i, nMints;
+    if ( nVars >= 5 )
+        return uTruth;
+    if ( nVars == 0 )
+        return (uTruth & 1) ? ~0u : 0;
+    nMints = 1 << nVars;
+    uTruth &= (1u << nMints) - 1;
+    for ( i = 0; i < 32; i++ )
+        if ( uTruth & (1u << (i & (nMints - 1))) )
+            uNorm |= 1u << i;
+    return uNorm;
+}
+
 ////////////////////////////////////////////////////////////////////////
 ///                     FUNCTION DEFINITIONS                         ///
 ////////////////////////////////////////////////////////////////////////
@@ -62,6 +78,9 @@ CloudNode * Kit_TruthToCloud5_rec( CloudManager * dd, unsigned uTruth, int nVars
     CloudNode * pCof0, * pCof1;
     unsigned uCof0, uCof1;
     assert( nVars <= 5 );
+    uTruth = Kit_TruthToCloud5Normalize( uTruth, nVars );
+    if ( nVars == 0 )
+        return (uTruth & 1) ? dd->one : dd->zero;
     if ( uTruth == 0 )
         return dd->zero;
     if ( uTruth == ~0 )
@@ -375,4 +394,3 @@ void Kit_TruthCofSupports( Vec_Int_t * vBddDir, Vec_Int_t * vBddInv, int nVars, 
 
 
 ABC_NAMESPACE_IMPL_END
-

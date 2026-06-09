@@ -179,7 +179,9 @@ void If_ObjPerformMappingAnd( If_Man_t * p, If_Obj_t * pObj, int Mode, int fPrep
     else if ( Mode == 1 )
         pObj->EstRefs = (float)((2.0 * pObj->EstRefs + pObj->nRefs) / 3.0);
     // deref the selected cut
-    if ( Mode && pObj->nRefs > 0 )
+    // Strict collection is read-only with respect to refs: it enumerates
+    // relaxed-depth candidates but should not perturb ABC's current cover.
+    if ( Mode && !p->fIfStrictCollect && pObj->nRefs > 0 )
         If_CutAreaDeref( p, If_ObjCutBest(pObj) );
 
     // prepare the cutset
@@ -245,7 +247,7 @@ IfMapBestCutDone:
             pCut->Delay = If_CutDelay( p, pObj, pCut );
         assert( pCut->Delay != -1 );
 //        assert( pCut->Delay <= pObj->Required + p->fEpsilon );
-        if ( pCut->Delay > pObj->Required + 2*p->fEpsilon )
+        if ( !p->fIfStrictCollect && pCut->Delay > pObj->Required + 2*p->fEpsilon )
             Abc_Print( 1, "If_ObjPerformMappingAnd(): Warning! Node with ID %d has delay (%f) exceeding the required times (%f).\n", 
                 pObj->Id, pCut->Delay, pObj->Required + p->fEpsilon );
         pCut->Area = (Mode == 2)? If_CutAreaDerefed( p, pCut ) : If_CutAreaFlow( p, pCut );
@@ -253,6 +255,7 @@ IfMapBestCutDone:
             pCut->Edge = (Mode == 2)? If_CutEdgeDerefed( p, pCut ) : If_CutEdgeFlow( p, pCut );
         if ( p->pPars->fPower )
             pCut->Power = (Mode == 2)? If_CutPowerDerefed( p, pCut, pObj ) : If_CutPowerFlow( p, pCut, pObj );
+        If_DualRecordCandidate( p, pObj, pCut );
         // save the best cut from the previous iteration
         if ( !fPreprocess || pCut->nLeaves <= 1 )
             If_CutCopy( p, pCutSet->ppCuts[pCutSet->nCuts++], pCut );
@@ -526,7 +529,10 @@ IfMapCutEvalDone:
             pCut->Delay = If_CutDelay( p, pObj, pCut );
         if ( pCut->Delay == -1 )
             continue;
-        if ( Mode && pCut->Delay > pObj->Required + p->fEpsilon && pCutSet->nCuts > 0 )
+        /* While collecting strict candidates, area-flow rounds may exceed the
+           classic required time.  Exact-area Mode 2 keeps the original required
+           filter because it depends on deref/ref consistency. */
+        if ( Mode && (!p->fIfStrictCollect || Mode == 2) && pCut->Delay > pObj->Required + p->fEpsilon && pCutSet->nCuts > 0 )
             continue;
         // compute area of the cut (this area may depend on the application specific cost)
         pCut->Area = (Mode == 2)? If_CutAreaDerefed( p, pCut ) : If_CutAreaFlow( p, pCut );
@@ -534,6 +540,7 @@ IfMapCutEvalDone:
             pCut->Edge = (Mode == 2)? If_CutEdgeDerefed( p, pCut ) : If_CutEdgeFlow( p, pCut );
         if ( p->pPars->fPower )
             pCut->Power = (Mode == 2)? If_CutPowerDerefed( p, pCut, pObj ) : If_CutPowerFlow( p, pCut, pObj );
+        If_DualRecordCandidate( p, pObj, pCut );
 //        pCut->AveRefs = (Mode == 0)? (float)0.0 : If_CutAverageRefs( p, pCut );
         // insert the cut into storage
         If_CutSort( p, pCutSet, pCut );
@@ -565,7 +572,9 @@ IfMapCutEvalDone:
 //        p->nBestCutSmall[1]++;
 
     // ref the selected cut
-    if ( Mode && pObj->nRefs > 0 )
+    // Paired with the deref skip above: relaxed collection must leave refs as
+    // the baseline mapper expects them.
+    if ( Mode && !p->fIfStrictCollect && pObj->nRefs > 0 )
         If_CutAreaRef( p, If_ObjCutBest(pObj) );
     if ( If_ObjCutBest(pObj)->fUseless )
         Abc_Print( 1, "The best cut is useless.  Please increase the number of cuts used by the mapper, for example: \"&if -C 32\"\n" );
@@ -597,7 +606,9 @@ void If_ObjPerformMappingChoice( If_Man_t * p, If_Obj_t * pObj, int Mode, int fP
     assert( pObj->pEquiv != NULL );
 
     // prepare
-    if ( Mode && pObj->nRefs > 0 )
+    // Choice nodes use the same relaxed collection rule as ordinary AND nodes:
+    // collect candidates, but do not deref/ref the active cover.
+    if ( Mode && !p->fIfStrictCollect && pObj->nRefs > 0 )
         If_CutAreaDeref( p, If_ObjCutBest(pObj) );
 
     // remove elementary cuts
@@ -628,7 +639,10 @@ void If_ObjPerformMappingChoice( If_Man_t * p, If_Obj_t * pObj, int Mode, int fP
                 continue;
             // check if the cut satisfies the required times
 //            assert( pCut->Delay == If_CutDelay( p, pTemp, pCut ) );
-            if ( Mode && pCut->Delay > pObj->Required + p->fEpsilon && pCutSet->nCuts > 0 )
+            /* In strict collection, Mode 1 records candidates up to the global
+               depth limit.  Mode 2 remains classic because deref area is tied
+               to the current reference cover. */
+            if ( Mode && (!p->fIfStrictCollect || Mode == 2) && pCut->Delay > pObj->Required + p->fEpsilon && pCutSet->nCuts > 0 )
                 continue;
             // set the phase attribute
             pCut->fCompl = pObj->fPhase ^ pTemp->fPhase;
@@ -638,6 +652,7 @@ void If_ObjPerformMappingChoice( If_Man_t * p, If_Obj_t * pObj, int Mode, int fP
                 pCut->Edge = (Mode == 2)? If_CutEdgeDerefed( p, pCut ) : If_CutEdgeFlow( p, pCut );
             if ( p->pPars->fPower )
                 pCut->Power = (Mode == 2)? If_CutPowerDerefed( p, pCut, pObj ) : If_CutPowerFlow( p, pCut, pObj );
+            If_DualRecordCandidate( p, pObj, pCut );
 //            pCut->AveRefs = (Mode == 0)? (float)0.0 : If_CutAverageRefs( p, pCut );
             // insert the cut into storage
             If_CutSort( p, pCutSet, pCut );
@@ -656,7 +671,8 @@ void If_ObjPerformMappingChoice( If_Man_t * p, If_Obj_t * pObj, int Mode, int fP
     }
 
     // ref the selected cut
-    if ( Mode && pObj->nRefs > 0 )
+    // Keep relaxed candidate enumeration side-effect free for choice nodes too.
+    if ( Mode && !p->fIfStrictCollect && pObj->nRefs > 0 )
         If_CutAreaRef( p, If_ObjCutBest(pObj) );
     // free the cuts
     If_ManDerefChoiceCutSet( p, pObj );

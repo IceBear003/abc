@@ -79,6 +79,9 @@ typedef struct If_Par_t_     If_Par_t;
 typedef struct If_Obj_t_     If_Obj_t;
 typedef struct If_Cut_t_     If_Cut_t;
 typedef struct If_Set_t_     If_Set_t;
+typedef struct If_Cand_t_    If_Cand_t;
+typedef struct If_DualPair_t_ If_DualPair_t;
+typedef struct If_DualAttr_t_ If_DualAttr_t;
 typedef struct If_LibLut_t_  If_LibLut_t;
 typedef struct If_LibCell_t_ If_LibCell_t;
 typedef struct If_LibBox_t_  If_LibBox_t;
@@ -152,6 +155,8 @@ struct If_Par_t_
     int                fUserLutDec;   // perform Boolean decomposition during mapping
     int                fUserLut2D;    // perform Boolean decomposition during mapping
     int                fDumpFile;     // dumping truth tables into a file
+    int                fStrictDepth;  // strict max-level dynamic programming
+    int                fDualOutput;   // dual-output LUT mapping
     int                fVerbose;      // the verbosity flag
     int                fVerboseTrace; // the verbosity flag
     char *             pLutStruct;    // LUT structure
@@ -302,6 +307,12 @@ struct If_Man_t_
     Vec_Int_t *        vVisited2;
     Vec_Int_t *        vCuts;
     Vec_Int_t *        vCutCosts;
+    int                fIfStrictCollect; // collect strict depth/size best cuts
+    int                nIfStrictMaxDepth;// current strict max-level constraint
+    int                nIfStrictMinDepth;// minimum depth found by delay mapping
+    int                nIfStrictBaseDepth;// baseline depth found by normal mapping
+    Vec_Ptr_t *        vIfMappedSingles; // mapped single-output LUT roots
+    Vec_Ptr_t *        vIfDualPairs;     // accepted dual-output LUT pairs
     // current cut context for user callbacks
     If_Obj_t *         pCutObjCur;    // current object whose cut is being checked
     If_Cut_t *         pCutCur;       // current cut being checked
@@ -345,6 +356,33 @@ struct If_Cut_t_
     int                pLeaves[0];
 };
 
+// strict-depth candidate cut, copied with the full variable-sized If_Cut_t
+struct If_Cand_t_
+{
+    int                Depth;         // integer output depth of the cut
+    int                Size;          // number of leaves
+    float              Area;          // area-flow/area cost used for selection
+    If_Cut_t           Cut;           // variable-sized cut data follows
+};
+
+// one accepted dual-output LUT window
+struct If_DualPair_t_
+{
+    int                Obj0;          // first output node ID
+    int                Obj1;          // second output node ID
+    int                nLeaves;       // number of union leaves
+    int                pLeaves[IF_MAX_LUTSIZE]; // sorted union leaves
+};
+
+// mapped-network attribute attached to paired ABC logic nodes
+struct If_DualAttr_t_
+{
+    int                iMate;         // paired ABC node ID in the same network
+    int                nLutSize;      // physical dual LUT size N
+    int                nLeaves;       // number of expanded shared data leaves
+    int                pLeaves[IF_MAX_LUTSIZE]; // expanded shared data leaf ABC IDs
+};
+
 // set of priority cut
 struct If_Set_t_
 {
@@ -385,6 +423,15 @@ struct If_Obj_t_
     };
     
     If_Set_t *         pCutSet;       // the pointer to the cutset
+    Vec_Ptr_t *        vIfBestCuts;   // strict-depth candidate cuts by depth/size
+    If_Obj_t *         pIfDualMate;   // paired dual-output LUT mate
+    If_Cand_t *        pIfCandBest;   // selected strict-depth candidate
+    unsigned           fIfMapped  : 1;// mapped in strict/dual backward cover
+    unsigned           fIfLocked  : 1;// locked after dual merge
+    unsigned           fIfDualRoot: 1;// representative endpoint of dual pair
+    unsigned           fIfSpare   :29;// padding for future IF-local flags
+    int                IfDepthLimit;  // tightest propagated depth limit
+    int                IfCandMinDepth;// minimum depth among saved strict candidates
     If_Cut_t           CutBest;       // the best cut selected 
 };
 
@@ -545,7 +592,15 @@ static inline float      If_CutLutDelay( If_LibLut_t * p, int Size, int iPin )  
 extern void            If_ManSetDefaultPars( If_Par_t * pPars );
 extern int             If_ManPerformMapping( If_Man_t * p );
 extern int             If_ManPerformMappingComb( If_Man_t * p );
+extern int             If_ManPerformMappingCombClassic( If_Man_t * p );
 extern void            If_ManComputeSwitching( If_Man_t * p );
+/*=== ifDual.c ==========================================================*/
+extern void            If_DualFreeObj( If_Man_t * p, If_Obj_t * pObj );
+extern void            If_DualClearAll( If_Man_t * p );
+extern void            If_DualRecordCandidate( If_Man_t * p, If_Obj_t * pObj, If_Cut_t * pCut );
+extern int             If_DualPerformStrictMapping( If_Man_t * p );
+extern int             If_DualFinalizeCover( If_Man_t * p );
+extern void            If_DualTransferAttrs( If_Man_t * pIfMan, void * pNtkNew );
 /*=== ifCut.c ============================================================*/
 extern int             If_CutVerifyCuts( If_Set_t * pCutSet, int fOrdered );
 extern int             If_CutFilter( If_Set_t * pCutSet, If_Cut_t * pCut, int fSaveCut0 );

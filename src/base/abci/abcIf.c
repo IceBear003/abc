@@ -365,6 +365,7 @@ Abc_Ntk_t * Abc_NtkFromIf( If_Man_t * pIfMan, Abc_Ntk_t * pNtk )
         else
             printf( "Duplicated %d gates to decouple the CO drivers.\n", nDupGates );
     }
+    If_DualTransferAttrs( pIfMan, pNtkNew );
     return pNtkNew;
 }
 
@@ -967,4 +968,3 @@ void Abc_NtkMarkMux( Abc_Obj_t * pDriver, Abc_Obj_t ** ppNode1, Abc_Obj_t ** ppN
 
 
 ABC_NAMESPACE_IMPL_END
-

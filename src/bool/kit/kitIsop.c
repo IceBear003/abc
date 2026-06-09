@@ -34,6 +34,22 @@ ABC_NAMESPACE_IMPL_START
 static unsigned * Kit_TruthIsop_rec( unsigned * puOn, unsigned * puOnDc, int nVars, Kit_Sop_t * pcRes, Vec_Int_t * vStore );
 static unsigned   Kit_TruthIsop5_rec( unsigned uOn, unsigned uOnDc, int nVars, Kit_Sop_t * pcRes, Vec_Int_t * vStore );
 
+static unsigned Kit_TruthIsop5Normalize( unsigned uTruth, int nVars )
+{
+    unsigned uNorm = 0;
+    int i, nMints;
+    if ( nVars >= 5 )
+        return uTruth;
+    if ( nVars == 0 )
+        return (uTruth & 1) ? ~0u : 0;
+    nMints = 1 << nVars;
+    uTruth &= (1u << nMints) - 1;
+    for ( i = 0; i < 32; i++ )
+        if ( uTruth & (1u << (i & (nMints - 1))) )
+            uNorm |= 1u << i;
+    return uNorm;
+}
+
 ////////////////////////////////////////////////////////////////////////
 ///                     FUNCTION DEFINITIONS                         ///
 ////////////////////////////////////////////////////////////////////////
@@ -138,6 +154,8 @@ int Kit_TruthIsop( unsigned * puTruth, int nVars, Vec_Int_t * vMemory, int fTryB
     unsigned * pResult;
     int RetValue = 0;
     assert( nVars >= 0 && nVars <= 16 );
+    if ( nVars < 5 )
+        puTruth[0] = Kit_TruthIsop5Normalize( puTruth[0], nVars );
     // if nVars < 5, make sure it does not depend on those vars
 //    for ( i = nVars; i < 5; i++ )
 //        assert( !Kit_TruthVarInSupport(puTruth, 5, i) );
@@ -356,6 +374,28 @@ unsigned Kit_TruthIsop5_rec( unsigned uOn, unsigned uOnDc, int nVars, Kit_Sop_t 
     unsigned uOn0, uOn1, uOnDc0, uOnDc1, uRes0, uRes1, uRes2;
     int i, k, Var;
     assert( nVars <= 5 );
+    uOn   = Kit_TruthIsop5Normalize( uOn,   nVars );
+    uOnDc = Kit_TruthIsop5Normalize( uOnDc, nVars );
+    if ( nVars == 0 )
+    {
+        if ( uOn & 1 )
+        {
+            pcRes->nLits  = 0;
+            pcRes->nCubes = 1;
+            pcRes->pCubes = Vec_IntFetch( vStore, 1 );
+            if ( pcRes->pCubes == NULL )
+            {
+                pcRes->nCubes = -1;
+                return 0;
+            }
+            pcRes->pCubes[0] = 0;
+            return 0xFFFFFFFF;
+        }
+        pcRes->nLits  = 0;
+        pcRes->nCubes = 0;
+        pcRes->pCubes = NULL;
+        return 0;
+    }
     assert( (uOn & ~uOnDc) == 0 );
     if ( uOn == 0 )
     {
@@ -441,4 +481,3 @@ unsigned Kit_TruthIsop5_rec( unsigned uOn, unsigned uOnDc, int nVars, Kit_Sop_t 
 
 
 ABC_NAMESPACE_IMPL_END
-

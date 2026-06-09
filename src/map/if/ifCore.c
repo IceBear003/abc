@@ -38,7 +38,7 @@ extern abctime s_MappingTime;
   Synopsis    []
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -64,6 +64,8 @@ void If_ManSetDefaultPars( If_Par_t * pPars )
     pPars->fBidec      =  0;
     pPars->fUserLutDec =  0;
     pPars->fUserLut2D  =  0;
+    pPars->fStrictDepth=  0;
+    pPars->fDualOutput =  0;
     pPars->fVerbose    =  0;
 }
 
@@ -73,7 +75,7 @@ void If_ManSetDefaultPars( If_Par_t * pPars )
   Synopsis    []
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -97,13 +99,31 @@ int If_ManPerformMapping( If_Man_t * p )
   Synopsis    []
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
 
 ***********************************************************************/
 int If_ManPerformMappingComb( If_Man_t * p )
+{
+    if ( p->pPars->fStrictDepth || p->pPars->fDualOutput )
+        return If_DualPerformStrictMapping( p );
+    return If_ManPerformMappingCombClassic( p );
+}
+
+/**Function*************************************************************
+
+  Synopsis    []
+
+  Description []
+
+  SideEffects []
+
+  SeeAlso     []
+
+***********************************************************************/
+int If_ManPerformMappingCombClassic( If_Man_t * p )
 {
     If_Obj_t * pObj;
     abctime clkTotal = Abc_Clock();
@@ -124,6 +144,8 @@ int If_ManPerformMappingComb( If_Man_t * p )
     {
         // map for delay
         If_ManPerformMappingRound( p, p->pPars->nCutsMax, 0, 1, 1, "Delay" );
+        if ( p->pPars->fStrictDepth || p->pPars->fDualOutput )
+            p->nIfStrictMinDepth = (int)(p->RequiredGlo + 0.999);
 
         // map for delay second option
         p->pPars->fFancy = 1;
@@ -137,7 +159,11 @@ int If_ManPerformMappingComb( If_Man_t * p )
         p->pPars->fArea = 0;
     }
     else
+    {
         If_ManPerformMappingRound( p, p->pPars->nCutsMax, 0, 0, 1, "Delay" );
+        if ( p->pPars->fStrictDepth || p->pPars->fDualOutput )
+            p->nIfStrictMinDepth = (int)(p->RequiredGlo + 0.999);
+    }
 
     // try to improve area by expanding and reducing the cuts
     if ( p->pPars->fExpRed )
@@ -198,6 +224,8 @@ int If_ManPerformMappingComb( If_Man_t * p )
 */
     p->pPars->FinalDelay = p->RequiredGlo;
     p->pPars->FinalArea  = p->AreaGlo;
+    if ( p->pPars->fStrictDepth || p->pPars->fDualOutput )
+        p->nIfStrictBaseDepth = (int)(p->RequiredGlo + 0.999);
     return 1;
 }
 

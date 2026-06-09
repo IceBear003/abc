@@ -465,6 +465,9 @@ char * Abc_SopCreateFromTruthIsop( Mem_Flex_t * pMan, int nVars, word * pTruth, 
     int w, nWords  = Abc_Truth6WordNum( nVars );
     assert( nVars < 16 );
 
+    if ( nVars == 0 )
+        return (pTruth[0] & 1) ? Abc_SopRegister( pMan, " 1\n" ) : Abc_SopRegister( pMan, " 0\n" );
+
     for ( w = 0; w < nWords; w++ )
         if ( pTruth[w] )
             break;
@@ -1470,4 +1473,3 @@ void Abc_SopToTruthBig( char * pSop, int nInputs, word ** pVars, word * pCube, w
 
 
 ABC_NAMESPACE_IMPL_END
-

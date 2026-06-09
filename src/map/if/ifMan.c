@@ -441,6 +441,7 @@ void If_ManStop( If_Man_t * p )
         p->pIfDsdMan = NULL;
     if ( p->pPars->fUseDsd && (p->nCountNonDec[0] || p->nCountNonDec[1]) )
         printf( "NonDec0 = %d.  NonDec1 = %d.\n", p->nCountNonDec[0], p->nCountNonDec[1] );
+    If_DualClearAll( p );
     Vec_IntFreeP( &p->vCoAttrs );
     Vec_PtrFree( p->vCis );
     Vec_PtrFree( p->vCos );
@@ -921,4 +922,3 @@ void If_ManSetupSetAll( If_Man_t * p, int nCrossCut )
 
 
 ABC_NAMESPACE_IMPL_END
-

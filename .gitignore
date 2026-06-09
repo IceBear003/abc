@@ -63,3 +63,11 @@ tags
 /cmake
 /cscope
 abc.history
+
+/if_dual_cec
+/if_dual_results
+/if_strict_cec
+
+/untest
+
+compile_commands.json

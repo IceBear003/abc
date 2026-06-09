@@ -21,6 +21,7 @@
 #include "ioAbc.h"
 #include "base/main/main.h"
 #include "map/mio/mio.h"
+#include "map/if/if.h"
 
 ABC_NAMESPACE_IMPL_START
 
@@ -41,6 +42,129 @@ static int  Io_WriteVerilogWiresCount( Abc_Ntk_t * pNtk );
 static char * Io_WriteVerilogGetName( char * pName );
 static int Io_WriteVerilogNodesHaveSameFanins( Abc_Obj_t * pNode, Abc_Obj_t * pNode2 );
 static int Io_WriteVerilogIsPrevTwinNode( Abc_Obj_t * pNode );
+static int Io_WriteVerilogLutHasDualAttrs( Abc_Ntk_t * pNtk );
+static void Io_WriteVerilogLutTransferDualAttrs( Abc_Ntk_t * pNtk, Abc_Ntk_t * pNtkTemp );
+static If_DualAttr_t * Io_WriteVerilogObjDualAttr( Abc_Obj_t * pObj );
+
+static void Io_WriteVerilogDualAttrFree( void * pMan, void * pObj )
+{
+    (void)pMan;
+    ABC_FREE( pObj );
+}
+
+static int Io_WriteVerilogLutHasDualAttrs( Abc_Ntk_t * pNtk )
+{
+    return pNtk && pNtk->vAttrs && Vec_PtrEntry(pNtk->vAttrs, VEC_ATTR_DATA1) != NULL;
+}
+
+static If_DualAttr_t * Io_WriteVerilogObjDualAttr( Abc_Obj_t * pObj )
+{
+    Vec_Att_t * pAttrs;
+    if ( pObj == NULL || pObj->pNtk == NULL || pObj->pNtk->vAttrs == NULL )
+        return NULL;
+    pAttrs = (Vec_Att_t *)Vec_PtrEntry( pObj->pNtk->vAttrs, VEC_ATTR_DATA1 );
+    return pAttrs ? (If_DualAttr_t *)Vec_AttEntry( pAttrs, pObj->Id ) : NULL;
+}
+
+static void Io_WriteVerilogLutTransferDualAttrs( Abc_Ntk_t * pNtk, Abc_Ntk_t * pNtkTemp )
+{
+    Vec_Att_t * pAttrsOld, * pAttrsNew;
+    Abc_Obj_t * pObj, * pMate;
+    If_DualAttr_t * pOld, * pNew;
+    int i, k;
+    if ( !Io_WriteVerilogLutHasDualAttrs(pNtk) )
+        return;
+    /* write_verilog -K may build a temporary SOP/netlist view before printing
+       LUT instances.  The dual-pair metadata is stored on ABC objects, so it
+       has to follow each node through pCopy into this temporary network. */
+    pAttrsOld = (Vec_Att_t *)Vec_PtrEntry( pNtk->vAttrs, VEC_ATTR_DATA1 );
+    pAttrsNew = Vec_AttAlloc( Abc_NtkObjNumMax(pNtkTemp) + 1, NULL, NULL, NULL, Io_WriteVerilogDualAttrFree );
+    Vec_PtrWriteEntry( pNtkTemp->vAttrs, VEC_ATTR_DATA1, pAttrsNew );
+    Abc_NtkForEachNode( pNtk, pObj, i )
+    {
+        pOld = (If_DualAttr_t *)Vec_AttEntry( pAttrsOld, pObj->Id );
+        if ( pOld == NULL || pObj->pCopy == NULL )
+            continue;
+        pMate = Abc_NtkObj( pNtk, pOld->iMate );
+        if ( pMate == NULL || pMate->pCopy == NULL )
+            continue;
+        pNew = ABC_CALLOC( If_DualAttr_t, 1 );
+        pNew->iMate = ((Abc_Obj_t *)pMate->pCopy)->Id;
+        pNew->nLutSize = pOld->nLutSize;
+        pNew->nLeaves = pOld->nLeaves;
+        for ( k = 0; k < pOld->nLeaves; k++ )
+        {
+            Abc_Obj_t * pLeaf = Abc_NtkObj( pNtk, pOld->pLeaves[k] );
+            Abc_Obj_t * pLeafCopy = pLeaf ? (Abc_Obj_t *)pLeaf->pCopy : NULL;
+            Abc_Obj_t * pLeafNet = pLeafCopy ? (Abc_Obj_t *)pLeafCopy->pCopy : NULL;
+            char Buffer[1000];
+            if ( pLeafNet == NULL && pLeaf )
+                pLeafNet = Abc_NtkFindNet( pNtkTemp, Abc_ObjName(pLeaf) );
+            if ( pLeafNet == NULL )
+            {
+                sprintf( Buffer, "new_%s", pLeaf ? Abc_ObjName(pLeaf) : "" );
+                pLeafNet = Abc_NtkFindNet( pNtkTemp, Buffer );
+            }
+            if ( pLeafNet == NULL )
+                break;
+            pNew->pLeaves[k] = pLeafNet->Id;
+        }
+        if ( k != pOld->nLeaves )
+        {
+            ABC_FREE( pNew );
+            continue;
+        }
+        Vec_AttWriteEntry( pAttrsNew, ((Abc_Obj_t *)pObj->pCopy)->Id, pNew );
+    }
+}
+
+static int Io_WriteVerilogLutFindFanin( Abc_Obj_t ** pFanins, int nFanins, Abc_Obj_t * pObj )
+{
+    int i;
+    for ( i = 0; i < nFanins; i++ )
+        if ( pFanins[i] == pObj )
+            return i;
+    return -1;
+}
+
+static int Io_WriteVerilogLutEvalDirect( Abc_Obj_t * pObj, word Truth, Abc_Obj_t ** pUnion, int nUnion, int Assign, int * pValue )
+{
+    Abc_Obj_t * pTerm;
+    int k, u, Mint = 0;
+    Abc_ObjForEachFanin( pObj, pTerm, k )
+    {
+        u = Io_WriteVerilogLutFindFanin( pUnion, nUnion, pTerm );
+        if ( u < 0 )
+            return 0;
+        if ( (Assign >> u) & 1 )
+            Mint |= 1 << k;
+    }
+    *pValue = (int)((Truth >> Mint) & 1);
+    return 1;
+}
+
+static int Io_WriteVerilogLutBuildMint( Abc_Obj_t * pObj, Abc_Obj_t * pMate, word TruthMate, Abc_Obj_t ** pUnion, int nUnion, int Assign, int * pMint )
+{
+    Abc_Obj_t * pTerm;
+    int k, u, Value, Mint = 0;
+    Abc_ObjForEachFanin( pObj, pTerm, k )
+    {
+        u = Io_WriteVerilogLutFindFanin( pUnion, nUnion, pTerm );
+        if ( u >= 0 )
+            Value = (Assign >> u) & 1;
+        else if ( pTerm == pMate )
+        {
+            if ( !Io_WriteVerilogLutEvalDirect( pMate, TruthMate, pUnion, nUnion, Assign, &Value ) )
+                return 0;
+        }
+        else
+            return 0;
+        if ( Value )
+            Mint |= 1 << k;
+    }
+    *pMint = Mint;
+    return 1;
+}
 
 ////////////////////////////////////////////////////////////////////////
 ///                     FUNCTION DEFINITIONS                         ///
@@ -798,8 +922,26 @@ char * Io_WriteVerilogGetName( char * pName )
 ***********************************************************************/
 void Io_WriteLutModule( FILE * pFile, int nLutSize )
 {    
-    fprintf( pFile, "module lut%d #( parameter TT = %d\'h0 ) ( input [%d:0] in, output out );\n", nLutSize, 1<<nLutSize, nLutSize-1 );
+    fprintf( pFile, "module lut%d ( in, out );\n", nLutSize );
+    fprintf( pFile, "    parameter TT = %d\'h0;\n", 1<<nLutSize );
+    fprintf( pFile, "    input [%d:0] in;\n", nLutSize-1 );
+    fprintf( pFile, "    output out;\n" );
     fprintf( pFile, "    assign out = TT[in];\n" );
+    fprintf( pFile, "endmodule\n\n" );
+}
+void Io_WriteDualLutModule( FILE * pFile, int nLutSize )
+{
+    int nSmall = nLutSize - 1;
+    fprintf( pFile, "module dual_lut%d ( in, z5, z );\n", nLutSize );
+    fprintf( pFile, "    parameter TT_Z5 = %d\'h0;\n", 1 << nSmall );
+    fprintf( pFile, "    parameter TT_Z = %d\'h0;\n", 1 << nSmall );
+    fprintf( pFile, "    input [%d:0] in;\n", nLutSize - 1 );
+    fprintf( pFile, "    output z5;\n" );
+    fprintf( pFile, "    output z;\n" );
+    fprintf( pFile, "    wire o0 = TT_Z5[in[%d:0]];\n", nSmall - 1 );
+    fprintf( pFile, "    wire o1 = TT_Z[in[%d:0]];\n", nSmall - 1 );
+    fprintf( pFile, "    assign z5 = o0;\n" );
+    fprintf( pFile, "    assign z = in[%d] ? o1 : o0;\n", nLutSize - 1 );
     fprintf( pFile, "endmodule\n\n" );
 }
 void Io_WriteFixedModules( FILE * pFile )
@@ -902,8 +1044,82 @@ void Io_WriteVerilogObjectsLut( FILE * pFile, Abc_Ntk_t * pNtk, int nLutSize, in
         }
     }
     else
+    {
+    Vec_Int_t * vPrinted = Vec_IntStart( Abc_NtkObjNumMax(pNtk) + 1 );
     Abc_NtkForEachNode( pNtk, pObj, i )
     {
+        If_DualAttr_t * pDual = Io_WriteVerilogObjDualAttr( pObj );
+        if ( Vec_IntEntry( vPrinted, pObj->Id ) )
+            continue;
+        if ( pDual )
+        {
+            Abc_Obj_t * pMate = Abc_NtkObj( pNtk, pDual->iMate );
+            Abc_Obj_t * pFanins[IF_MAX_LUTSIZE];
+            word Truth0, Truth1, Truth0u = 0, Truth1u = 0;
+            int nUnion = 0, b, m, nMints, nDigitsHex;
+            char NameOut0[500], NameOut1[500];
+            /* Be conservative at the writer boundary.  If the mate disappeared
+               during temporary-network construction, or if both endpoints map
+               to the same printable net, emit the current node as a normal LUT. */
+            if ( pMate == pObj )
+                goto IoWriteSingleLut;
+            if ( pMate == NULL || !Abc_ObjIsNode(pMate) || pDual->nLutSize != nLutSize )
+                goto IoWriteSingleLut;
+            if ( Vec_IntEntry( vPrinted, pMate->Id ) )
+                goto IoWriteSingleLut;
+            if ( Abc_ObjFanout0(pObj) == Abc_ObjFanout0(pMate) )
+                goto IoWriteSingleLut;
+            if ( !strcmp( Abc_ObjName(Abc_ObjFanout0(pObj)), Abc_ObjName(Abc_ObjFanout0(pMate)) ) )
+                goto IoWriteSingleLut;
+            strcpy( NameOut0, Io_WriteVerilogGetName(Abc_ObjName(Abc_ObjFanout0(pObj))) );
+            strcpy( NameOut1, Io_WriteVerilogGetName(Abc_ObjName(Abc_ObjFanout0(pMate))) );
+            if ( !strcmp( NameOut0, NameOut1 ) )
+                goto IoWriteSingleLut;
+            nUnion = pDual->nLeaves;
+            for ( k = 0; k < nUnion; k++ )
+            {
+                pFanins[k] = Abc_NtkObj( pNtk, pDual->pLeaves[k] );
+                if ( pFanins[k] == NULL )
+                    goto IoWriteSingleLut;
+            }
+            /* The hardware model is two (N-1)-input LUTs sharing the same data
+               inputs plus a fixed select input.  Larger unions are outside the
+               implemented simple dual-output case. */
+            if ( nUnion > nLutSize - 1 )
+                goto IoWriteSingleLut;
+            Truth0 = Abc_SopToTruth( (char *)pObj->pData, Abc_ObjFaninNum(pObj) );
+            Truth1 = Abc_SopToTruth( (char *)pMate->pData, Abc_ObjFaninNum(pMate) );
+            nMints = 1 << nUnion;
+            /* Re-express both local SOP truth tables over the expanded shared
+               input order.  If one endpoint is a fanin of the other, compose the
+               upstream truth value into the downstream local truth table. */
+            for ( b = 0; b < nMints; b++ )
+            {
+                int Mint0 = 0, Mint1 = 0;
+                if ( !Io_WriteVerilogLutBuildMint( pObj, pMate, Truth1, pFanins, nUnion, b, &Mint0 ) )
+                    goto IoWriteSingleLut;
+                if ( !Io_WriteVerilogLutBuildMint( pMate, pObj, Truth0, pFanins, nUnion, b, &Mint1 ) )
+                    goto IoWriteSingleLut;
+                if ( (Truth0 >> Mint0) & 1 )
+                    Truth0u |= ((word)1) << b;
+                if ( (Truth1 >> Mint1) & 1 )
+                    Truth1u |= ((word)1) << b;
+            }
+            nDigitsHex = Abc_MaxInt( 1, 1 << (nLutSize - 3) );
+            fprintf( pFile, "  dual_lut%d #(%d\'h%0*llx, %d\'h%0*llx) dual_%0*d ( {", nLutSize,
+                1 << (nLutSize - 1), nDigitsHex, (unsigned long long)Truth0u,
+                1 << (nLutSize - 1), nDigitsHex, (unsigned long long)Truth1u, nDigits, Counter++ );
+            fprintf( pFile, "%*s", Length, "1\'b1" );
+            for ( m = nLutSize - 2; m >= nUnion; m-- )
+                fprintf( pFile, ", %*s", Length, "1\'b0" );
+            for ( m = nUnion - 1; m >= 0; m-- )
+                fprintf( pFile, ", %*s", Length, Io_WriteVerilogGetName(Abc_ObjName(pFanins[m])) );
+            fprintf( pFile, "}, %*s, %*s );\n", Length, NameOut0, Length, NameOut1 );
+            Vec_IntWriteEntry( vPrinted, pObj->Id, 1 );
+            Vec_IntWriteEntry( vPrinted, pMate->Id, 1 );
+            continue;
+        }
+    IoWriteSingleLut:
         word Truth = Abc_SopToTruth( (char *)pObj->pData, Abc_ObjFaninNum(pObj) );
         fprintf( pFile, "  lut%d #(%d\'h", nLutSize, 1<<nLutSize );
         if ( nLutSize == 6 )
@@ -916,6 +1132,9 @@ void Io_WriteVerilogObjectsLut( FILE * pFile, Abc_Ntk_t * pNtk, int nLutSize, in
         for ( k = Abc_ObjFaninNum(pObj) - 1; k >= 0; k-- )
             fprintf( pFile, "%*s%s", Length, Io_WriteVerilogGetName(Abc_ObjName(Abc_ObjFanin(pObj, k))), k==0 ? "":", " );
         fprintf( pFile, "}, %*s );\n", Length, Io_WriteVerilogGetName(Abc_ObjName(Abc_ObjFanout0(pObj))) );
+        Vec_IntWriteEntry( vPrinted, pObj->Id, 1 );
+    }
+    Vec_IntFree( vPrinted );
     }
 }
 void Io_WriteVerilogLutInt( FILE * pFile, Abc_Ntk_t * pNtk, int nLutSize, int fFixed, int fNewInterface )
@@ -1018,9 +1237,12 @@ void Io_WriteVerilogLut( Abc_Ntk_t * pNtk, char * pFileName, int nLutSize, int f
             Io_WriteFixedModules( pFile );
         else
             Io_WriteLutModule( pFile, nLutSize );
+        if ( Io_WriteVerilogLutHasDualAttrs(pNtk) )
+            Io_WriteDualLutModule( pFile, nLutSize );
     }
     pNtkTemp = Abc_NtkToNetlist( pNtk );
     Abc_NtkToSop( pNtkTemp, -1, ABC_INFINITY );
+    Io_WriteVerilogLutTransferDualAttrs( pNtk, pNtkTemp );
     Io_WriteVerilogLutInt( pFile, pNtkTemp, nLutSize, fFixed, fNewInterface );
     Abc_NtkDelete( pNtkTemp );
 

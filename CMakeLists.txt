@@ -89,6 +89,13 @@ extract_var(SEPARATOR_LIBS ABC_LIBS ${MAKE_OUTPUT})
 extract_var(SEPARATOR_CFLAGS ABC_CFLAGS ${MAKE_OUTPUT})
 extract_var(SEPARATOR_CXXFLAGS ABC_CXXFLAGS ${MAKE_OUTPUT})
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/map/if/ifDual.c")
+    list(FIND ABC_SRC src/map/if/ifDual.c ABC_IF_DUAL_INDEX)
+    if(ABC_IF_DUAL_INDEX EQUAL -1)
+        list(APPEND ABC_SRC src/map/if/ifDual.c)
+    endif()
+endif()
+
 if(ABC_USE_NAMESPACE)
     set_source_files_properties(${ABC_SRC} PROPERTIES LANGUAGE CXX)
 endif()
