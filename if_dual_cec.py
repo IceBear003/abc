@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import re
 import shlex
@@ -219,6 +220,21 @@ def run_abc(abc: Path, command: str) -> tuple[int, str, float]:
     return retcode, "".join(chunks), time.perf_counter() - start
 
 
+def run_abc_capture(abc: Path, command: str) -> tuple[int, str, float]:
+    argv = [str(abc), "-c", command]
+    if shutil.which("stdbuf"):
+        argv = ["stdbuf", "-oL", "-eL"] + argv
+    start = time.perf_counter()
+    proc = subprocess.run(
+        argv,
+        cwd=abc.parent,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    return proc.returncode, proc.stdout or "", time.perf_counter() - start
+
+
 def cec_status(retcode: int, log: str) -> str:
     if retcode != 0:
         return "error"
@@ -231,14 +247,47 @@ def cec_status(retcode: int, log: str) -> str:
     return "unknown"
 
 
+def run_case(abc: Path, mapped_dir: Path, out_dir: Path, src: Path, bench_dir: Path, mode: str, stream: bool) -> dict[str, str]:
+    rel = src.relative_to(bench_dir)
+    stem = rel.with_suffix("")
+    mapped = mapped_dir / mode / f"{stem}.v"
+    blif = out_dir / "blif" / mode / f"{stem}.blif"
+    log_path = out_dir / "logs" / mode / f"{stem}.log"
+    row = {"design": str(rel), "mode": mode, "mapped": str(mapped), "blif": str(blif)}
+    if not mapped.exists():
+        row.update({"status": "missing", "runtime_sec": "0.000"})
+        return row
+    try:
+        mapped_verilog_to_blif(mapped, blif)
+    except Exception as exc:
+        row.update({"status": "convert_error", "runtime_sec": "0.000", "message": str(exc)})
+        return row
+    command = f"cec {shlex.quote(str(src.resolve()))} {shlex.quote(str(blif.resolve()))}"
+    if stream:
+        retcode, log, elapsed = run_abc(abc.resolve(), command)
+    else:
+        retcode, log, elapsed = run_abc_capture(abc.resolve(), command)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(log)
+    row.update({
+        "status": cec_status(retcode, log),
+        "runtime_sec": f"{elapsed:.3f}",
+        "log": str(log_path),
+    })
+    return row
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--abc", type=Path, default=Path("./abc"))
     parser.add_argument("--bench-dir", type=Path, default=Path("benchmarks-master"))
     parser.add_argument("--mapped-dir", type=Path, default=Path("if_dual_results"))
     parser.add_argument("--out-dir", type=Path, default=Path("if_dual_cec"))
+    parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--mode", choices=["baseline", "strict", "dual"], action="append")
     args = parser.parse_args()
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
 
     modes = args.mode or ["baseline", "strict", "dual"]
     benches = sorted(args.bench_dir.rglob("*.v"))
@@ -247,35 +296,32 @@ def main() -> int:
         return 1
 
     rows: list[dict[str, str]] = []
-    for src in benches:
-        rel = src.relative_to(args.bench_dir)
-        stem = rel.with_suffix("")
-        for mode in modes:
-            mapped = args.mapped_dir / mode / f"{stem}.v"
-            blif = args.out_dir / "blif" / mode / f"{stem}.blif"
-            log_path = args.out_dir / "logs" / mode / f"{stem}.log"
-            row = {"design": str(rel), "mode": mode, "mapped": str(mapped), "blif": str(blif)}
-            print(f"\n===== CEC {rel} [{mode}] start =====", flush=True)
-            if not mapped.exists():
-                row.update({"status": "missing", "runtime_sec": "0.000"})
-                print(f"missing mapped Verilog: {mapped}")
+    if args.jobs == 1:
+        for src in benches:
+            rel = src.relative_to(args.bench_dir)
+            for mode in modes:
+                print(f"\n===== CEC {rel} [{mode}] start =====", flush=True)
+                row = run_case(args.abc, args.mapped_dir, args.out_dir, src, args.bench_dir, mode, True)
                 rows.append(row)
-                continue
-            try:
-                mapped_verilog_to_blif(mapped, blif)
-            except Exception as exc:
-                row.update({"status": "convert_error", "runtime_sec": "0.000", "message": str(exc)})
-                print(f"conversion failed: {exc}")
+                if row["status"] == "missing":
+                    print(f"missing mapped Verilog: {row['mapped']}")
+                elif row["status"] == "convert_error":
+                    print(f"conversion failed: {row.get('message', '')}")
+                print(f"===== CEC {rel} [{mode}] {row['status']} in {float(row['runtime_sec']):.2f}s =====\n", flush=True)
+    else:
+        jobs = [(src, mode) for src in benches for mode in modes]
+        print(f"running {len(jobs)} CEC jobs with {args.jobs} workers", flush=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
+            future_to_job = {
+                executor.submit(run_case, args.abc, args.mapped_dir, args.out_dir, src, args.bench_dir, mode, False): (src, mode)
+                for src, mode in jobs
+            }
+            for future in concurrent.futures.as_completed(future_to_job):
+                src, mode = future_to_job[future]
+                rel = src.relative_to(args.bench_dir)
+                row = future.result()
                 rows.append(row)
-                continue
-            command = f"cec {shlex.quote(str(src.resolve()))} {shlex.quote(str(blif.resolve()))}"
-            retcode, log, elapsed = run_abc(args.abc.resolve(), command)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_text(log)
-            status = cec_status(retcode, log)
-            row.update({"status": status, "runtime_sec": f"{elapsed:.3f}", "log": str(log_path)})
-            rows.append(row)
-            print(f"===== CEC {rel} [{mode}] {status} in {elapsed:.2f}s =====\n", flush=True)
+                print(f"===== CEC {rel} [{mode}] {row['status']} in {float(row['runtime_sec']):.2f}s =====", flush=True)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     summary = args.out_dir / "cec_summary.csv"
@@ -283,7 +329,7 @@ def main() -> int:
     with summary.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(sorted(rows, key=lambda row: (row["design"], modes.index(row["mode"]) if row["mode"] in modes else len(modes))))
     bad = [r for r in rows if r.get("status") != "pass"]
     print(f"wrote {summary}")
     if bad:
