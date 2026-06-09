@@ -193,8 +193,9 @@ def mapped_verilog_to_blif(src: Path, dst: Path) -> None:
         vars_seen, rows = truth_rows(z5_terms, z5_tt, width - 1)
         emit_names(lines, vars_seen, m.group("z5"), rows)
 
-        # General dual model: z = select ? TT_Z(in[N-2:0]) : TT_Z5(in[N-2:0]).
-        z_vars, z_rows = truth_rows(terms, (z_tt << (1 << (width - 1))) | z5_tt, width)
+        # The emitted dual_lutN keeps the physical select pin for pin counting,
+        # but z is the second (N-1)-input LUT output and does not depend on it.
+        z_vars, z_rows = truth_rows(z5_terms, z_tt, width - 1)
         emit_names(lines, z_vars, m.group("z"), z_rows)
 
     lines.append(".end")

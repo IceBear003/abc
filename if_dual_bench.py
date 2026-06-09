@@ -130,8 +130,7 @@ def stats_from_verilog(path: Path, lut_size: int) -> dict[str, int]:
             z5_terms = inputs_all[1:]
             z5_support = support_signals(z5_terms, parse_truth_const(params[0]), n - 1)
             z_tt = parse_truth_const(params[1])
-            z5_tt = parse_truth_const(params[0])
-            z_support = support_signals(inputs_all, (z_tt << (1 << (n - 1))) | z5_tt, n)
+            z_support = support_signals(z5_terms, z_tt, n - 1)
             deps[clean_sig(m_dual.group("z5"))] = z5_support
             deps[clean_sig(m_dual.group("z"))] = z_support
             dual_count += 1

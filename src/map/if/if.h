@@ -381,6 +381,8 @@ struct If_DualAttr_t_
     int                nLutSize;      // physical dual LUT size N
     int                nLeaves;       // number of expanded shared data leaves
     int                pLeaves[IF_MAX_LUTSIZE]; // expanded shared data leaf ABC IDs
+    word               uTruth0;       // truth table for this endpoint over pLeaves
+    word               uTruth1;       // truth table for iMate over pLeaves
 };
 
 // set of priority cut

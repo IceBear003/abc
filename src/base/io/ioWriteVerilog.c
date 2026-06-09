@@ -66,6 +66,39 @@ static If_DualAttr_t * Io_WriteVerilogObjDualAttr( Abc_Obj_t * pObj )
     return pAttrs ? (If_DualAttr_t *)Vec_AttEntry( pAttrs, pObj->Id ) : NULL;
 }
 
+static Abc_Obj_t * Io_WriteVerilogLutFindTempNetByName( Abc_Ntk_t * pNtkTemp, const char * pName )
+{
+    Abc_Obj_t * pNet;
+    char Buffer[1000];
+    if ( pName == NULL )
+        return NULL;
+    pNet = Abc_NtkFindNet( pNtkTemp, (char *)pName );
+    if ( pNet )
+        return pNet;
+    sprintf( Buffer, "new_%s", pName );
+    return Abc_NtkFindNet( pNtkTemp, Buffer );
+}
+
+static Abc_Obj_t * Io_WriteVerilogLutMapTempNet( Abc_Ntk_t * pNtkTemp, Abc_Obj_t * pObj )
+{
+    Abc_Obj_t * pCopy, * pNet;
+    if ( pObj == NULL )
+        return NULL;
+    pCopy = (Abc_Obj_t *)pObj->pCopy;
+    if ( pCopy && pCopy->pCopy )
+        return (Abc_Obj_t *)pCopy->pCopy;
+    if ( pCopy && Abc_ObjIsNet(pCopy) )
+        return pCopy;
+    if ( pCopy && Abc_ObjFanoutNum(pCopy) > 0 && Abc_ObjIsNet(Abc_ObjFanout0(pCopy)) )
+        return Abc_ObjFanout0(pCopy);
+    pNet = Io_WriteVerilogLutFindTempNetByName( pNtkTemp, Abc_ObjName(pObj) );
+    if ( pNet )
+        return pNet;
+    if ( Abc_ObjFanoutNum(pObj) > 0 )
+        return Io_WriteVerilogLutFindTempNetByName( pNtkTemp, Abc_ObjName(Abc_ObjFanout0(pObj)) );
+    return NULL;
+}
+
 static void Io_WriteVerilogLutTransferDualAttrs( Abc_Ntk_t * pNtk, Abc_Ntk_t * pNtkTemp )
 {
     Vec_Att_t * pAttrsOld, * pAttrsNew;
@@ -92,19 +125,12 @@ static void Io_WriteVerilogLutTransferDualAttrs( Abc_Ntk_t * pNtk, Abc_Ntk_t * p
         pNew->iMate = ((Abc_Obj_t *)pMate->pCopy)->Id;
         pNew->nLutSize = pOld->nLutSize;
         pNew->nLeaves = pOld->nLeaves;
+        pNew->uTruth0 = pOld->uTruth0;
+        pNew->uTruth1 = pOld->uTruth1;
         for ( k = 0; k < pOld->nLeaves; k++ )
         {
             Abc_Obj_t * pLeaf = Abc_NtkObj( pNtk, pOld->pLeaves[k] );
-            Abc_Obj_t * pLeafCopy = pLeaf ? (Abc_Obj_t *)pLeaf->pCopy : NULL;
-            Abc_Obj_t * pLeafNet = pLeafCopy ? (Abc_Obj_t *)pLeafCopy->pCopy : NULL;
-            char Buffer[1000];
-            if ( pLeafNet == NULL && pLeaf )
-                pLeafNet = Abc_NtkFindNet( pNtkTemp, Abc_ObjName(pLeaf) );
-            if ( pLeafNet == NULL )
-            {
-                sprintf( Buffer, "new_%s", pLeaf ? Abc_ObjName(pLeaf) : "" );
-                pLeafNet = Abc_NtkFindNet( pNtkTemp, Buffer );
-            }
+            Abc_Obj_t * pLeafNet = Io_WriteVerilogLutMapTempNet( pNtkTemp, pLeaf );
             if ( pLeafNet == NULL )
                 break;
             pNew->pLeaves[k] = pLeafNet->Id;
@@ -116,54 +142,6 @@ static void Io_WriteVerilogLutTransferDualAttrs( Abc_Ntk_t * pNtk, Abc_Ntk_t * p
         }
         Vec_AttWriteEntry( pAttrsNew, ((Abc_Obj_t *)pObj->pCopy)->Id, pNew );
     }
-}
-
-static int Io_WriteVerilogLutFindFanin( Abc_Obj_t ** pFanins, int nFanins, Abc_Obj_t * pObj )
-{
-    int i;
-    for ( i = 0; i < nFanins; i++ )
-        if ( pFanins[i] == pObj )
-            return i;
-    return -1;
-}
-
-static int Io_WriteVerilogLutEvalDirect( Abc_Obj_t * pObj, word Truth, Abc_Obj_t ** pUnion, int nUnion, int Assign, int * pValue )
-{
-    Abc_Obj_t * pTerm;
-    int k, u, Mint = 0;
-    Abc_ObjForEachFanin( pObj, pTerm, k )
-    {
-        u = Io_WriteVerilogLutFindFanin( pUnion, nUnion, pTerm );
-        if ( u < 0 )
-            return 0;
-        if ( (Assign >> u) & 1 )
-            Mint |= 1 << k;
-    }
-    *pValue = (int)((Truth >> Mint) & 1);
-    return 1;
-}
-
-static int Io_WriteVerilogLutBuildMint( Abc_Obj_t * pObj, Abc_Obj_t * pMate, word TruthMate, Abc_Obj_t ** pUnion, int nUnion, int Assign, int * pMint )
-{
-    Abc_Obj_t * pTerm;
-    int k, u, Value, Mint = 0;
-    Abc_ObjForEachFanin( pObj, pTerm, k )
-    {
-        u = Io_WriteVerilogLutFindFanin( pUnion, nUnion, pTerm );
-        if ( u >= 0 )
-            Value = (Assign >> u) & 1;
-        else if ( pTerm == pMate )
-        {
-            if ( !Io_WriteVerilogLutEvalDirect( pMate, TruthMate, pUnion, nUnion, Assign, &Value ) )
-                return 0;
-        }
-        else
-            return 0;
-        if ( Value )
-            Mint |= 1 << k;
-    }
-    *pMint = Mint;
-    return 1;
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -941,7 +919,7 @@ void Io_WriteDualLutModule( FILE * pFile, int nLutSize )
     fprintf( pFile, "    wire o0 = TT_Z5[in[%d:0]];\n", nSmall - 1 );
     fprintf( pFile, "    wire o1 = TT_Z[in[%d:0]];\n", nSmall - 1 );
     fprintf( pFile, "    assign z5 = o0;\n" );
-    fprintf( pFile, "    assign z = in[%d] ? o1 : o0;\n", nLutSize - 1 );
+    fprintf( pFile, "    assign z = o1;\n" );
     fprintf( pFile, "endmodule\n\n" );
 }
 void Io_WriteFixedModules( FILE * pFile )
@@ -1055,8 +1033,7 @@ void Io_WriteVerilogObjectsLut( FILE * pFile, Abc_Ntk_t * pNtk, int nLutSize, in
         {
             Abc_Obj_t * pMate = Abc_NtkObj( pNtk, pDual->iMate );
             Abc_Obj_t * pFanins[IF_MAX_LUTSIZE];
-            word Truth0, Truth1, Truth0u = 0, Truth1u = 0;
-            int nUnion = 0, b, m, nMints, nDigitsHex;
+            int nUnion = 0, m, nDigitsHex;
             char NameOut0[500], NameOut1[500];
             /* Be conservative at the writer boundary.  If the mate disappeared
                during temporary-network construction, or if both endpoints map
@@ -1087,28 +1064,12 @@ void Io_WriteVerilogObjectsLut( FILE * pFile, Abc_Ntk_t * pNtk, int nLutSize, in
                implemented simple dual-output case. */
             if ( nUnion > nLutSize - 1 )
                 goto IoWriteSingleLut;
-            Truth0 = Abc_SopToTruth( (char *)pObj->pData, Abc_ObjFaninNum(pObj) );
-            Truth1 = Abc_SopToTruth( (char *)pMate->pData, Abc_ObjFaninNum(pMate) );
-            nMints = 1 << nUnion;
-            /* Re-express both local SOP truth tables over the expanded shared
-               input order.  If one endpoint is a fanin of the other, compose the
-               upstream truth value into the downstream local truth table. */
-            for ( b = 0; b < nMints; b++ )
-            {
-                int Mint0 = 0, Mint1 = 0;
-                if ( !Io_WriteVerilogLutBuildMint( pObj, pMate, Truth1, pFanins, nUnion, b, &Mint0 ) )
-                    goto IoWriteSingleLut;
-                if ( !Io_WriteVerilogLutBuildMint( pMate, pObj, Truth0, pFanins, nUnion, b, &Mint1 ) )
-                    goto IoWriteSingleLut;
-                if ( (Truth0 >> Mint0) & 1 )
-                    Truth0u |= ((word)1) << b;
-                if ( (Truth1 >> Mint1) & 1 )
-                    Truth1u |= ((word)1) << b;
-            }
+            /* The mapper has already simulated the two accepted cones over this
+               union-leaf order, so the writer only serializes the stored TT. */
             nDigitsHex = Abc_MaxInt( 1, 1 << (nLutSize - 3) );
             fprintf( pFile, "  dual_lut%d #(%d\'h%0*llx, %d\'h%0*llx) dual_%0*d ( {", nLutSize,
-                1 << (nLutSize - 1), nDigitsHex, (unsigned long long)Truth0u,
-                1 << (nLutSize - 1), nDigitsHex, (unsigned long long)Truth1u, nDigits, Counter++ );
+                1 << (nLutSize - 1), nDigitsHex, (unsigned long long)pDual->uTruth0,
+                1 << (nLutSize - 1), nDigitsHex, (unsigned long long)pDual->uTruth1, nDigits, Counter++ );
             fprintf( pFile, "%*s", Length, "1\'b1" );
             for ( m = nLutSize - 2; m >= nUnion; m-- )
                 fprintf( pFile, ", %*s", Length, "1\'b0" );

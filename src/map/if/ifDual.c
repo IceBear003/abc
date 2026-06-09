@@ -12,6 +12,7 @@
 
 #include "if.h"
 #include "base/abc/abc.h"
+#include "aig/hop/hop.h"
 #include "misc/util/abc_global.h"
 
 ABC_NAMESPACE_IMPL_START
@@ -1170,24 +1171,175 @@ static void If_DualAttrFree( void * pMan, void * pObj )
     ABC_FREE( pObj );
 }
 
+/* 在 final ABC mapped cone 的 union leaf 顺序中查找边界对象。 */
+static int If_DualFindAbcUnionLeaf( Abc_Obj_t ** pLeaves, int nLeaves, Abc_Obj_t * pLeaf )
+{
+    int i;
+    for ( i = 0; i < nLeaves; i++ )
+        if ( pLeaves[i] == pLeaf )
+            return i;
+    return -1;
+}
+
+/* HOP 局部函数的 PI 顺序等于 ABC node 的 fanin 顺序；这里把 PI 对回数组下标。 */
+static int If_DualFindHopPi( Hop_Man_t * pMan, Hop_Obj_t * pObj, int nVars )
+{
+    int i;
+    for ( i = 0; i < nVars && i < Hop_ManPiNum(pMan); i++ )
+        if ( Hop_ManPi(pMan, i) == pObj )
+            return i;
+    return -1;
+}
+
+/* 在给定 fanin 取值下求一个 HOP 函数值。补边作为 HOP 指针的一部分递归处理。 */
+static int If_DualEvalHopFunc_rec( Hop_Man_t * pMan, Hop_Obj_t * pRoot, int * pFanValues, int nVars, int * pValue )
+{
+    Hop_Obj_t * pObj = Hop_Regular( pRoot );
+    int fCompl = Hop_IsComplement( pRoot );
+    int Value0, Value1, iVar;
+    if ( Hop_ObjIsConst1(pObj) )
+    {
+        *pValue = 1 ^ fCompl;
+        return 1;
+    }
+    if ( Hop_ObjIsPi(pObj) )
+    {
+        iVar = If_DualFindHopPi( pMan, pObj, nVars );
+        if ( iVar < 0 )
+            return 0;
+        *pValue = pFanValues[iVar] ^ fCompl;
+        return 1;
+    }
+    if ( !Hop_ObjIsNode(pObj) )
+        return 0;
+    if ( !If_DualEvalHopFunc_rec( pMan, Hop_ObjChild0(pObj), pFanValues, nVars, &Value0 ) )
+        return 0;
+    if ( !If_DualEvalHopFunc_rec( pMan, Hop_ObjChild1(pObj), pFanValues, nVars, &Value1 ) )
+        return 0;
+    *pValue = (Hop_ObjIsExor(pObj) ? (Value0 ^ Value1) : (Value0 & Value1)) ^ fCompl;
+    return 1;
+}
+
+/* 用当前 network 的函数类型计算一个 mapped node 的局部函数。默认 if -K
+   生成 HOP/AIG；若用户显式生成 SOP，也走同一套 fanin 值接口。 */
+static int If_DualEvalAbcNodeFunc( Abc_Ntk_t * pNtkNew, Abc_Obj_t * pObj, int * pFanValues, int nFanins, int * pValue )
+{
+    if ( Abc_NtkHasAig(pNtkNew) )
+        return pObj->pData && If_DualEvalHopFunc_rec( (Hop_Man_t *)pNtkNew->pManFunc, (Hop_Obj_t *)pObj->pData, pFanValues, nFanins, pValue );
+    if ( Abc_NtkHasSop(pNtkNew) )
+    {
+        char * pSop = (char *)pObj->pData;
+        word Truth;
+        int i, Mint = 0, nVars;
+        if ( pSop == NULL || pSop[0] == 0 || Abc_SopIsConst0(pSop) )
+        {
+            *pValue = 0;
+            return 1;
+        }
+        if ( Abc_SopIsConst1(pSop) )
+        {
+            *pValue = 1;
+            return 1;
+        }
+        nVars = Abc_SopGetVarNum(pSop);
+        if ( nVars < 0 || nVars != nFanins )
+            return 0;
+        Truth = Abc_SopToTruth( pSop, nVars );
+        for ( i = 0; i < nFanins; i++ )
+            if ( pFanValues[i] )
+                Mint |= 1 << i;
+        *pValue = (int)((Truth >> Mint) & 1);
+        return 1;
+    }
+    return 0;
+}
+
+/* 从最终 ABC mapped network 递归仿真一个小 cone。遇到 union leaf 就停下；
+   内部节点先递归求 fanin cone，再求该 mapped node 自己的 HOP/SOP 局部函数。 */
+static int If_DualEvalAbcConeOnUnion( Abc_Ntk_t * pNtkNew, Abc_Obj_t * pObj, Abc_Obj_t ** pLeaves, int nLeaves, int Assign, Vec_Int_t * vValues, Vec_Int_t * vMarks, int Mark, int * pValue )
+{
+    Abc_Obj_t * pFanin;
+    int i, u, Value, pFanValues[IF_MAX_FUNC_LUTSIZE];
+    if ( pObj == NULL )
+        return 0;
+    u = If_DualFindAbcUnionLeaf( pLeaves, nLeaves, pObj );
+    if ( u >= 0 )
+    {
+        *pValue = (Assign >> u) & 1;
+        return 1;
+    }
+    if ( Abc_ObjIsNode(pObj) && Vec_IntEntry(vMarks, pObj->Id) == Mark )
+    {
+        *pValue = Vec_IntEntry(vValues, pObj->Id);
+        return 1;
+    }
+    if ( Abc_ObjIsNode(pObj) && Abc_NodeIsConst(pObj) )
+    {
+        *pValue = Abc_NodeIsConst1(pObj);
+        return 1;
+    }
+    if ( !Abc_ObjIsNode(pObj) || pObj->pData == NULL )
+        return 0;
+    if ( Abc_ObjFaninNum(pObj) > IF_MAX_FUNC_LUTSIZE )
+        return 0;
+    Abc_ObjForEachFanin( pObj, pFanin, i )
+    {
+        if ( !If_DualEvalAbcConeOnUnion( pNtkNew, pFanin, pLeaves, nLeaves, Assign, vValues, vMarks, Mark, &Value ) )
+            return 0;
+        pFanValues[i] = Value;
+    }
+    if ( !If_DualEvalAbcNodeFunc( pNtkNew, pObj, pFanValues, Abc_ObjFaninNum(pObj), pValue ) )
+        return 0;
+    Vec_IntWriteEntry( vValues, pObj->Id, *pValue );
+    Vec_IntWriteEntry( vMarks, pObj->Id, Mark );
+    return 1;
+}
+
+/* 对最终 ABC cone 做 2^(N-1) 穷举仿真，生成 dual_lutN 参数。 */
+static int If_DualBuildAbcConeTruthOnUnion( Abc_Ntk_t * pNtkNew, Abc_Obj_t * pObj, Abc_Obj_t ** pLeaves, int nLeaves, word * pTruthUnion )
+{
+    Vec_Int_t * vValues, * vMarks;
+    int b, Value, nMints;
+    if ( nLeaves > 6 )
+        return 0;
+    *pTruthUnion = 0;
+    vValues = Vec_IntStart( Abc_NtkObjNumMax(pNtkNew) + 1 );
+    vMarks  = Vec_IntStart( Abc_NtkObjNumMax(pNtkNew) + 1 );
+    nMints = 1 << nLeaves;
+    for ( b = 0; b < nMints; b++ )
+    {
+        if ( !If_DualEvalAbcConeOnUnion( pNtkNew, pObj, pLeaves, nLeaves, b, vValues, vMarks, b + 1, &Value ) )
+        {
+            Vec_IntFree( vValues );
+            Vec_IntFree( vMarks );
+            return 0;
+        }
+        if ( Value )
+            Abc_TtSetBit( pTruthUnion, b );
+    }
+    Vec_IntFree( vValues );
+    Vec_IntFree( vMarks );
+    return 1;
+}
+
 /* 将 IF dual pair 转成 ABC network 属性，供 write_verilog -K 输出 dual_lutN。 */
 void If_DualTransferAttrs( If_Man_t * pIfMan, void * pNtkNewVoid )
 {
     Abc_Ntk_t * pNtkNew = (Abc_Ntk_t *)pNtkNewVoid;
     Vec_Att_t * pAttrs;
     If_DualPair_t * pPair;
-    int i;
+    int i, nPairs = 0, nFailed = 0;
     if ( !pIfMan->pPars->fDualOutput || pIfMan->vIfDualPairs == NULL || Vec_PtrSize(pIfMan->vIfDualPairs) == 0 )
         return;
     pAttrs = Vec_AttAlloc( Abc_NtkObjNumMax(pNtkNew) + 1, NULL, NULL, NULL, If_DualAttrFree );
     Vec_PtrWriteEntry( pNtkNew->vAttrs, VEC_ATTR_DATA1, pAttrs );
     Vec_PtrForEachEntry( If_DualPair_t *, pIfMan->vIfDualPairs, pPair, i )
     {
-        If_Obj_t * pIfObj0 = If_ManObj( pIfMan, pPair->Obj0 );
-        If_Obj_t * pIfObj1 = If_ManObj( pIfMan, pPair->Obj1 );
-        Abc_Obj_t * pObj0 = (Abc_Obj_t *)If_ObjCopy( pIfObj0 );
-        Abc_Obj_t * pObj1 = (Abc_Obj_t *)If_ObjCopy( pIfObj1 );
+        Abc_Obj_t * pObj0 = (Abc_Obj_t *)If_ObjCopy( If_ManObj( pIfMan, pPair->Obj0 ) );
+        Abc_Obj_t * pObj1 = (Abc_Obj_t *)If_ObjCopy( If_ManObj( pIfMan, pPair->Obj1 ) );
+        Abc_Obj_t * pLeafObjs[IF_MAX_LUTSIZE];
         If_DualAttr_t * pAttr0, * pAttr1;
+        word Truth0 = 0, Truth1 = 0;
         int k;
         if ( pObj0 == NULL || pObj1 == NULL )
             continue;
@@ -1204,6 +1356,7 @@ void If_DualTransferAttrs( If_Man_t * pIfMan, void * pNtkNewVoid )
             Abc_Obj_t * pLeaf = (Abc_Obj_t *)If_ObjCopy( pIfLeaf );
             if ( pLeaf == NULL )
                 break;
+            pLeafObjs[k] = pLeaf;
             pAttr0->pLeaves[k] = pAttr1->pLeaves[k] = pLeaf->Id;
         }
         if ( k != pPair->nLeaves )
@@ -1212,9 +1365,24 @@ void If_DualTransferAttrs( If_Man_t * pIfMan, void * pNtkNewVoid )
             ABC_FREE( pAttr1 );
             continue;
         }
+        nPairs++;
+        if ( !If_DualBuildAbcConeTruthOnUnion( pNtkNew, pObj0, pLeafObjs, pPair->nLeaves, &Truth0 ) ||
+             !If_DualBuildAbcConeTruthOnUnion( pNtkNew, pObj1, pLeafObjs, pPair->nLeaves, &Truth1 ) )
+        {
+            nFailed++;
+            ABC_FREE( pAttr0 );
+            ABC_FREE( pAttr1 );
+            continue;
+        }
+        pAttr0->uTruth0 = Truth0;
+        pAttr0->uTruth1 = Truth1;
+        pAttr1->uTruth0 = Truth1;
+        pAttr1->uTruth1 = Truth0;
         Vec_AttWriteEntry( pAttrs, pObj0->Id, pAttr0 );
         Vec_AttWriteEntry( pAttrs, pObj1->Id, pAttr1 );
     }
+    if ( nFailed || pIfMan->pPars->fVerbose )
+        Abc_Print( 1, "  If-dual-attrs pairs=%d cone_truth=%d failed=%d\n", nPairs, nPairs - nFailed, nFailed );
 }
 
 ////////////////////////////////////////////////////////////////////////
