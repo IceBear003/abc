@@ -2,9 +2,7 @@
 
 ##  Dual-Output LUT Mapping
 
-Here is a [fork](https://github.com/yongshiwo/abc.git) of ABC containing Agdmap, a novel technology mapper for LUT-based FPGAs. 
-
-This ABC fork includes dual-output LUT mapping in the IF mapper.  The flow maps a design to ordinary single-output LUTs and, when legal, packs compatible pairs into one physical dual-output LUT.  The dual-output legality model is selected by architecture and constrains the total input set, each output's input set, and the shared-input budget.
+Here is a [fork](https://github.com/yongshiwo/abc.git) of ABC. This ABC fork includes dual-output LUT mapping in the IF mapper.  The flow maps a design to ordinary single-output LUTs and, when legal, packs compatible pairs into one physical dual-output LUT.  The dual-output legality model is selected by architecture and constrains the total input set, each output's input set, and the shared-input budget.
 
 Use `-P` to enable dual-output mapping and `-Q` to select the target architecture:
 
