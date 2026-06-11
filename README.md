@@ -1,22 +1,35 @@
-[![.github/workflows/build-posix.yml](https://github.com/berkeley-abc/abc/actions/workflows/build-posix.yml/badge.svg)](https://github.com/berkeley-abc/abc/actions/workflows/build-posix.yml)
-[![.github/workflows/build-windows.yml](https://github.com/berkeley-abc/abc/actions/workflows/build-windows.yml/badge.svg)](https://github.com/berkeley-abc/abc/actions/workflows/build-windows.yml)
-[![.github/workflows/build-posix-cmake.yml](https://github.com/berkeley-abc/abc/actions/workflows/build-posix-cmake.yml/badge.svg)](https://github.com/berkeley-abc/abc/actions/workflows/build-posix-cmake.yml)
-
 # ABC: System for Sequential Logic Synthesis and Formal Verification
 
-ABC is always changing but the current snapshot is believed to be stable.
+##  Dual-Output LUT Mapping
 
-## ABC fork with new features
+Here is a [fork](https://github.com/yongshiwo/abc.git) of ABC containing Agdmap, a novel technology mapper for LUT-based FPGAs. 
 
-Here is a [fork](https://github.com/yongshiwo/abc.git) of ABC containing Agdmap, a novel technology mapper for LUT-based FPGAs.  Agdmap is based on a technology mapping algorithm with adaptive gate decomposition [1]. It is a cut enumeration based mapping algorithm with bin packing for simultaneous wide gate decomposition, which is a patent pending technology.
+This ABC fork includes dual-output LUT mapping in the IF mapper.  The flow maps a design to ordinary single-output LUTs and, when legal, packs compatible pairs into one physical dual-output LUT.  The dual-output legality model is selected by architecture and constrains the total input set, each output's input set, and the shared-input budget.
 
-The mapper is developed and maintained by Longfei Fan and Prof. Chang Wu at Fudan University in Shanghai, China.  The experimental results presented in [1] indicate that Agdmap can substantially improve area (by 10% or more) when compared against the best LUT mapping solutions in ABC, such as command "if".
+Use `-P` to enable dual-output mapping and `-Q` to select the target architecture:
 
-The source code is provided for research and evaluation only. For commercial usage, please contact Prof. Chang Wu at wuchang@fudan.edu.cn.
+```sh
+read_verilog top.v
+strash
+dch
+if -K 6 -P -Q ultrascale
+write_verilog -K 6 mapped.v
+```
 
-References:
+Supported architecture models:
 
-[1] L. Fan and C. Wu, "FPGA technology mapping with adaptive gate decompostion", ACM/SIGDA FPGA International Symposium on FPGAs, 2023. 
+| Architecture | Single LUT size | Dual total inputs | Shared-input budget | Per-output inputs |
+| --- | ---: | ---: | ---: | ---: |
+| `ultrascale` | 6 | 5 | 5 | 5 |
+| `versal` | 6 | 6 | 6 | 6 |
+| `alm` | 8 | 8 | 4 | 6 |
+
+Without `-Q`, the mapper keeps the legacy generic behavior.  Mapped Verilog uses `lutN` for ordinary LUTs and `dual_lutN` for packed dual-output physical LUTs.  Run the included benchmark and CEC helpers with:
+
+```sh
+python3 if_dual_bench.py --abc ./abc --bench-dir benchmarks/tested --out-dir if_dual_results --arch all --jobs 32
+python3 if_dual_cec.py --abc ./abc --bench-dir benchmarks/tested --mapped-dir if_dual_results --out-dir if_dual_cec --arch all --jobs 32
+```
 
 ## Compiling:
 
@@ -117,9 +130,4 @@ add these steps in the readme to help folks compiling this on Solaris."
 The following tutorial is kindly offered by Ana Petkovska from EPFL:
 https://www.dropbox.com/s/qrl9svlf0ylxy8p/ABC_GettingStarted.pdf
 
-## Final remarks:
 
-Unfortunately, there is no comprehensive regression test. Good luck!                                
-
-This system is maintained by Alan Mishchenko <alanmi@berkeley.edu>. Consider also 
-using ZZ framework developed by Niklas Een: https://bitbucket.org/niklaseen/abc-zz (or https://github.com/berkeley-abc/abc-zz)
